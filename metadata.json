@@ -1,0 +1,10 @@
+{
+  "name": "Paxton Interpreter v1",
+  "description": "Local speech-to-intent interpreter pipeline designed specifically to transcribe, translate, and learn phonetic speech patterns (like Down syndrome speech variations) into accurate intent using Whisper and Llama 3.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

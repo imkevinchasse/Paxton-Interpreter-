@@ -1,5 +1,5 @@
-import { useState, useRef } from 'react';
-import { Mic, CheckCircle2, ListPlus } from 'lucide-react';
+import { useState, useRef, useEffect } from 'react';
+import { Mic, CheckCircle2, ListPlus, Trash2 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { type TrainingItem } from '../types';
 
@@ -12,6 +12,22 @@ export function TrainingStudio() {
   const [saving, setSaving] = useState(false);
   const [success, setSuccess] = useState(false);
   const [savedItems, setSavedItems] = useState<TrainingItem[]>([]);
+
+  useEffect(() => {
+    fetch('/api/training_data')
+      .then(res => res.json())
+      .then(data => setSavedItems(data))
+      .catch(console.error);
+  }, []);
+
+  const handleDelete = async (id: string) => {
+    try {
+      await fetch(`/api/training_data/${id}`, { method: 'DELETE' });
+      setSavedItems(prev => prev.filter(item => item.id !== id));
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
@@ -243,10 +259,15 @@ export function TrainingStudio() {
            )}
            <div className="space-y-3 max-h-64 overflow-y-auto pr-2">
              {savedItems.map((item, i) => (
-               <div key={item.id} className="bg-white border border-slate-200 p-4 rounded-xl shadow-sm space-y-2">
+               <div key={item.id} className="bg-white border border-slate-200 p-4 rounded-xl shadow-sm space-y-2 group">
                   <div className="flex justify-between items-center">
                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{item.category}</span>
-                     {item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
+                     <div className="flex items-center space-x-2">
+                       {item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
+                       <button onClick={() => handleDelete(item.id)} className="text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100">
+                         <Trash2 className="w-4 h-4" />
+                       </button>
+                     </div>
                   </div>
                   <div className="text-sm text-slate-800 font-medium">"{item.meaning}"</div>
                   <div className="text-xs text-slate-500 font-mono opacity-80">Sounds like: {item.sound || '(empty)'}</div>

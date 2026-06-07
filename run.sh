@@ -106,7 +106,7 @@ if [ "$SERVER_BUILT" = false ]; then
   
   if command -v cmake >/dev/null 2>&1; then
     echo "⚙️  Building with CMake..."
-    cmake -B build -DWHISPER_BUILD_SERVER=ON
+    cmake -B build -DWHISPER_BUILD_SERVER=ON -DWHISPER_METAL=ON
     cmake --build build --config Release
   else
     echo "❌ CMake installation failed. Please install manually to build Whisper server."

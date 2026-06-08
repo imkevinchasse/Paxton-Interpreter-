@@ -228,81 +228,99 @@ app.post('/api/audio_bank/:id/process', async (req, res) => {
 
         let duration = 0;
         try {
-           const durationOutput = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audio.path}"`);
+           const { stdout: durationOutput } = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audio.path}"`);
            duration = parseFloat(durationOutput.trim());
            console.log(`--> Audio duration: ${duration.toFixed(2)}s`);
         } catch(e) {
            console.log(`--> Failed to read duration directly, proceeding with standard processing.`);
         }
 
-        if (duration > 15) {
-           console.log(`--> Long audio detected (>${15}s). Chunking sentences into trainable snippets by silence...`);
-           
-           const chunkBase = audio.path + "_chunk";
-           await execAsync(`ffmpeg -y -i "${audio.path}" -f segment -segment_time 7 -c copy "${chunkBase}_%03d.wav"`);
-           
-           const newItems = [];
-           const dir = path.dirname(audio.path);
-           const files = fs.readdirSync(dir).filter(f => f.startsWith(path.basename(chunkBase)) && f.endsWith('.wav'));
-           
-           for (const f of files) {
-              const chunkPath = path.join(dir, f);
-              const trimmedPath = chunkPath + "_trim.wav";
-              await execAsync(`ffmpeg -y -i "${chunkPath}" -af silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse "${trimmedPath}"`);
-              
-              const stats = fs.statSync(trimmedPath);
-              if (stats.size > 4096) {
-                 const guess = await WhisperEngine.transcribe(trimmedPath);
-                 const newFilename = audio.filename.replace(/\.[^/.]+$/, "") + `_snippet_${newItems.length + 1}.wav`;
-                 const finalPath = path.join(dir, newFilename);
-                 fs.renameSync(trimmedPath, finalPath);
-                 newItems.push({
-                   id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
-                   filename: newFilename,
-                   path: finalPath,
-                   timestamp: new Date().toISOString(),
-                   status: 'processed' as const,
-                   sound: guess,
-                   isCut: true
-                 });
-              } else {
-                 if (fs.existsSync(trimmedPath)) fs.unlinkSync(trimmedPath);
-              }
-              fs.unlinkSync(chunkPath);
-           }
-           
-           if (newItems.length > 0) {
-              audioBank.splice(audioIndex, 1, ...newItems);
-              saveAudioBank();
-              console.log(`[✅] Split long audio into ${newItems.length} trainable snippets.`);
-              return res.json(newItems[0]); 
-           } else {
-              console.log(`[🔇] All chunks were primarily silence. Proceeding with standard cut.`);
-           }
-        }
-        
-        // Standard single-file process
-        const outputPath = `${audio.path}_cut.wav`;
-        await execAsync(`ffmpeg -y -i "${audio.path}" -af silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse "${outputPath}"`);
-        
-        const stats = fs.statSync(outputPath);
-        if (stats.size < 4096) { 
-           console.log(`[🔇] Audio clip primarily silence, deleting...`);
-           fs.unlinkSync(outputPath);
-           if (fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
-           audioBank = audioBank.filter(a => a.id !== id);
-           saveAudioBank();
-           return res.status(400).json({ error: "Audio was only silence and was deleted." });
-        }
-        
-         const newFilename = audio.filename.replace(/\.[^/.]+$/, "") + '_cut.wav';
-         const finalPath = path.join(path.dirname(audio.path), newFilename);
-         fs.renameSync(outputPath, finalPath);
+                 console.log(`--> Analyzing audio for silences to split into accurate snippets...`);
+         let sdErr = '';
+         try {
+            const { stderr } = await execAsync(`ffmpeg -y -i "${audio.path}" -af silencedetect=noise=-30dB:d=0.5 -f null -`);
+            sdErr = stderr;
+         } catch(e: any) {
+            sdErr = e.stderr || '';
+         }
          
-         audio.path = finalPath;
-         audio.filename = newFilename;
-         audio.sound = await WhisperEngine.transcribe(finalPath);
-      } catch (e) {
+         const lines = sdErr.split('\n');
+         const silences: {start?: number, end?: number}[] = [];
+         
+         for(const line of lines) {
+           const sMatch = line.match(/silence_start: ([\d\.]+)/);
+           if (sMatch) silences.push({ start: parseFloat(sMatch[1]) });
+           const eMatch = line.match(/silence_end: ([\d\.]+)/);
+           if (eMatch && silences.length > 0) silences[silences.length-1].end = parseFloat(eMatch[1]);
+         }
+         
+         const segments: {start: number, end: number}[] = [];
+         let curr = 0;
+         for(const s of silences) {
+           if (s.start !== undefined && s.start > curr + 0.2) {
+             segments.push({ start: curr, end: s.start });
+           }
+           if (s.end !== undefined) curr = s.end;
+         }
+         if (duration > 0 && curr < duration - 0.2) {
+           segments.push({ start: curr, end: duration });
+         } else if (duration === 0) {
+           segments.push({ start: curr, end: 999999 }); 
+         }
+
+         if (segments.length === 0 && duration > 0) {
+            segments.push({ start: 0, end: duration });
+         } else if (segments.length === 0) {
+            segments.push({ start: 0, end: 999999 });
+         }
+
+         const newItems = [];
+         const dir = path.dirname(audio.path);
+         
+         for (let i = 0; i < segments.length; i++) {
+           const seg = segments[i];
+           const suffix = segments.length > 1 ? `_snippet_${i + 1}.wav` : `_cut.wav`;
+           const newFilename = audio.filename.replace(/\.[^/.]+$/, "") + suffix;
+           const cutPath = path.join(dir, newFilename);
+           try {
+              const endArg = seg.end < 999999 ? `-to ${seg.end}` : "";
+              await execAsync(`ffmpeg -y -i "${audio.path}" -ss ${seg.start} ${endArg} -af silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse -c:a pcm_s16le "${cutPath}"`);
+              
+              if (fs.existsSync(cutPath)) {
+                 const stats = fs.statSync(cutPath);
+                 if (stats.size > 4096) {
+                    const guess = await WhisperEngine.transcribe(cutPath);
+                    newItems.push({
+                      id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                      filename: newFilename,
+                      path: cutPath,
+                      timestamp: new Date().toISOString(),
+                      status: 'processed' as const,
+                      sound: guess,
+                      isCut: true
+                    });
+                 } else {
+                    fs.unlinkSync(cutPath);
+                 }
+              }
+           } catch(err) {
+              console.error(`Failed to process segment ${i}`, err);
+           }
+         }
+         
+         if (fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
+         
+         if (newItems.length > 0) {
+            audioBank.splice(audioIndex, 1, ...newItems);
+            saveAudioBank();
+            console.log(`[✅] Split audio into ${newItems.length} cut sections.`);
+            return res.json(newItems[0]); 
+         } else {
+            console.log(`[🔇] Audio clip primarily silence, deleting...`);
+            audioBank = audioBank.filter(a => a.id !== id);
+            saveAudioBank();
+            return res.status(400).json({ error: "Audio was only silence and was deleted." });
+         }     } catch (e) {
         console.error("FFmpeg processing failed", e);
       }
     }

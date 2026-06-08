@@ -1,7 +1,7 @@
 import { type PipelineResult } from '../types';
 import { motion } from 'motion/react';
 import { Check, X, ListCollapse, Activity, Volume2 } from 'lucide-react';
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 
 const playDing = () => {
   try {

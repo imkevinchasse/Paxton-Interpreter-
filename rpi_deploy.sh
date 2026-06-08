@@ -25,7 +25,7 @@ fi
 echo "=========================================================="
 echo "📦 Syncing codebase (excluding bulky folders)..."
 echo "=========================================================="
-rsync -avz --exclude 'node_modules' --exclude '.git' --exclude 'dist' --exclude 'uploads' --exclude '*.json' --exclude 'whisper.cpp' ./ "$RPI_USER@$RPI_IP:~/paxton-interpreter/"
+rsync -avz --exclude 'node_modules' --exclude '.git' --exclude 'dist' --exclude 'uploads' --exclude '*.json' --exclude 'whisper' ./ "$RPI_USER@$RPI_IP:~/paxton-interpreter/"
 
 echo "=========================================================="
 echo "🔧 Running setup directly on the Raspberry Pi..."

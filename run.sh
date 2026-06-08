@@ -88,7 +88,7 @@ else
 fi
 
 echo "=> [5/8] Checking Whisper.cpp (Local STT API)"
-WHISPER_DIR="./whisper.cpp"
+WHISPER_DIR="./whisper"
 if [ ! -d "$WHISPER_DIR" ]; then
   read -p "⚠️ Whisper.cpp not found. Clone and build locally? [Y/n] " -n 1 -r
   echo ""
@@ -103,11 +103,11 @@ fi
 cd "$WHISPER_DIR"
 
 SERVER_BUILT=false
-if [ -f "./build/bin/whisper-server" ] || [ -f "./build/bin/server" ] || [ -f "./server" ] || [ -f "./whisper-server" ]; then
+if [ -f "./build/bin/whisper-server" ] || [ -f "./build/bin/server" ] || [ -f "./build/bin/Release/whisper-server" ] || [ -f "./build/bin/Release/server" ] || [ -f "./server" ] || [ -f "./whisper-server" ]; then
   SERVER_BUILT=true
 fi
 
-if [ "$SERVER_BUILT" = false ] && [ -d "$WHISPER_DIR" ]; then
+if [ "$SERVER_BUILT" = false ]; then
   read -p "⚠️ Whisper server not built. Build it now? [Y/n] " -n 1 -r
   echo ""
   if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
@@ -155,12 +155,16 @@ cd ..
 echo "=> [6/8] Starting Whisper OS API Gateway..."
 if ! curl -s -f http://localhost:8080/ >/dev/null 2>&1; then
   echo "Starting Whisper server on port 8080..."
-  cd whisper.cpp
+  cd whisper
   WHISPER_EXEC=""
   if [ -f "./build/bin/whisper-server" ]; then
     WHISPER_EXEC="./build/bin/whisper-server"
   elif [ -f "./build/bin/server" ]; then
     WHISPER_EXEC="./build/bin/server"
+  elif [ -f "./build/bin/Release/whisper-server" ]; then
+    WHISPER_EXEC="./build/bin/Release/whisper-server"
+  elif [ -f "./build/bin/Release/server" ]; then
+    WHISPER_EXEC="./build/bin/Release/server"
   elif [ -f "./server" ]; then
     WHISPER_EXEC="./server"
   elif [ -f "./whisper-server" ]; then

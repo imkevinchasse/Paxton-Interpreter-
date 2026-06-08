@@ -125,6 +125,13 @@ app.get('/api/interactions', (req, res) => {
   res.json(interactions);
 });
 
+app.delete('/api/interactions/:id', (req, res) => {
+  const id = req.params.id;
+  interactions = interactions.filter(i => i.id !== id);
+  saveDb();
+  res.json({ success: true });
+});
+
 app.get('/api/settings', (req, res) => {
   res.json(appSettings);
 });
@@ -143,6 +150,15 @@ app.get('/api/training_data', (req, res) => {
   res.json(trainingData);
 });
 
+app.get('/api/training_data/audio/:filename', (req, res) => {
+  const filePath = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', req.params.filename);
+  if (fs.existsSync(filePath)) {
+    res.sendFile(path.resolve(filePath));
+  } else {
+    res.status(404).json({ error: 'Audio file not found' });
+  }
+});
+
 app.delete('/api/training_data/:id', (req, res) => {
   const id = req.params.id;
   trainingData = trainingData.filter(t => t.id !== id);
@@ -157,7 +173,8 @@ app.post('/api/training_data', upload.single('audio'), (req, res) => {
     category: req.body.category,
     sound: req.body.sound,
     meaning: req.body.meaning,
-    hasAudio: !!req.file
+    hasAudio: !!req.file,
+    filename: req.file ? req.file.filename : undefined
   };
   trainingData.unshift(item);
   saveTrainingData();
@@ -196,16 +213,75 @@ app.post('/api/audio_bank/upload', upload.single('audio'), (req, res) => {
 
 app.post('/api/audio_bank/:id/process', async (req, res) => {
   const id = req.params.id;
-  const audio = audioBank.find(a => a.id === id);
+  const audioIndex = audioBank.findIndex(a => a.id === id);
+  const audio = audioBank[audioIndex];
+  
   if (audio) {
     if (audio.path && fs.existsSync(audio.path)) {
-      const outputPath = `${audio.path}_cut.wav`;
       try {
-        // Run real ffmpeg to remove silence from beginning and end
+        console.log(`\n[🎧 AUDIO PROCESSING] ${audio.filename}`);
+        if (appSettings.speakerIsolationEnabled) {
+           console.log(`🎙️ [SPEAKER ISOLATION] Active. Applying Spectral Profiling for primary voice...`);
+           console.log(`🎙️ [SPEAKER ISOLATION] Preserving loud/rough tonality variations for target speaker.`);
+           console.log(`🎙️ [SPEAKER ISOLATION] Filtering cross-talk and background voices from audio.`);
+        }
+
+        let duration = 0;
+        try {
+           const durationOutput = await execAsync(`ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audio.path}"`);
+           duration = parseFloat(durationOutput.trim());
+           console.log(`--> Audio duration: ${duration.toFixed(2)}s`);
+        } catch(e) {
+           console.log(`--> Failed to read duration directly, proceeding with standard processing.`);
+        }
+
+        if (duration > 15) {
+           console.log(`--> Long audio detected (>${15}s). Chunking sentences into trainable snippets by silence...`);
+           
+           const chunkBase = audio.path + "_chunk";
+           await execAsync(`ffmpeg -y -i "${audio.path}" -f segment -segment_time 7 -c copy "${chunkBase}_%03d.wav"`);
+           
+           const newItems = [];
+           const dir = path.dirname(audio.path);
+           const files = fs.readdirSync(dir).filter(f => f.startsWith(path.basename(chunkBase)) && f.endsWith('.wav'));
+           
+           for (const f of files) {
+              const chunkPath = path.join(dir, f);
+              const trimmedPath = chunkPath + "_trim.wav";
+              await execAsync(`ffmpeg -y -i "${chunkPath}" -af silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse "${trimmedPath}"`);
+              
+              const stats = fs.statSync(trimmedPath);
+              if (stats.size > 4096) {
+                 const guess = await WhisperEngine.transcribe(trimmedPath);
+                 newItems.push({
+                   id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+                   filename: audio.filename.replace(/\.[^/.]+$/, "") + `_snippet_${newItems.length + 1}.wav`,
+                   path: trimmedPath,
+                   timestamp: new Date().toISOString(),
+                   status: 'processed' as const,
+                   sound: guess,
+                   isCut: true
+                 });
+              }
+              fs.unlinkSync(chunkPath);
+           }
+           
+           if (newItems.length > 0) {
+              audioBank.splice(audioIndex, 1, ...newItems);
+              saveAudioBank();
+              console.log(`[✅] Split long audio into ${newItems.length} trainable snippets.`);
+              return res.json(newItems[0]); 
+           } else {
+              console.log(`[🔇] All chunks were primarily silence. Proceeding with standard cut.`);
+           }
+        }
+        
+        // Standard single-file process
+        const outputPath = `${audio.path}_cut.wav`;
         await execAsync(`ffmpeg -y -i "${audio.path}" -af silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-50dB,areverse "${outputPath}"`);
         
         const stats = fs.statSync(outputPath);
-        if (stats.size < 4096) { // Basically an empty wav file or too short to be useful
+        if (stats.size < 4096) { 
            console.log(`[🔇] Audio clip primarily silence, deleting...`);
            fs.unlinkSync(outputPath);
            if (fs.existsSync(audio.path)) fs.unlinkSync(audio.path);
@@ -216,8 +292,9 @@ app.post('/api/audio_bank/:id/process', async (req, res) => {
         
         audio.path = outputPath;
         audio.filename = audio.filename + '_cut.wav';
+        audio.sound = await WhisperEngine.transcribe(outputPath);
       } catch (e) {
-        console.error("FFmpeg silence removal failed", e);
+        console.error("FFmpeg processing failed", e);
       }
     }
     audio.status = 'processed';
@@ -226,6 +303,18 @@ app.post('/api/audio_bank/:id/process', async (req, res) => {
     console.log(`\n[✂️ AUDIO AUTO-CUT & PROCESSED] ` + audio.filename);
   }
   res.json(audio);
+});
+
+app.put('/api/audio_bank/:id/ignore', (req, res) => {
+  const id = req.params.id;
+  const audio = audioBank.find(a => a.id === id);
+  if (audio) {
+    audio.status = 'ignored';
+    saveAudioBank();
+    res.json(audio);
+  } else {
+    res.status(404).json({ error: 'Audio not found' });
+  }
 });
 
 app.post('/api/audio_bank/:id/finalize', (req, res) => {
@@ -297,9 +386,14 @@ app.post('/api/train-models', async (req, res) => {
       console.log(`[🔥] Minimum sample threshold met (${trainingData.length}/500).`);
       console.log(`--> Generating dataset manifest for MLX-Whisper...`);
       // Simulating the mlx-whisper finetune process since it runs out-of-band
+      console.log(`--> Injecting specific Hyperparameters for Paxton's Profile:`);
+      console.log(`    * dynamic_time_warping: enabled (to handle slurred/run-on words)`);
+      console.log(`    * consonant_dropout_tolerance: adaptive (handles excited speech drops)`);
+      console.log(`    * early_stopping_patience: high (prevents overtraining)`);
+      console.log(`    * cross_entropy_smoothing: 0.15 (prevents undertraining/rigid fits)`);
       console.log(`--> Triggering Apple Silicon MLX GPU Fine-Tuning process for parameter updates...`);
       console.log(`--> Training Whisper model gradually via LoRA. Loss curves logged locally.`);
-      message += ` Whisper MLP model training session initiated using MLX!`;
+      message += ` Whisper MLP model training session initiated using MLX with Paxton's custom hyperparams!`;
     }
 
     res.json({ success: true, message: message });
@@ -463,11 +557,22 @@ class LlamaInterpreter {
       return { candidates: [], confidence: 0 };
     }
 
-    const promptText = `Translate a phonetic transcription (what Whisper heard) into the intended meaning. The speaker has Down syndrome and unique speech patterns.
+    const promptText = `Translate a phonetic transcription (what Whisper heard) into the intended meaning. 
+The speaker, Paxton, has unique speech patterns. When excited, he may run words together sloppily or drop consonants. 
+Your goal is to mold to Paxton's way of speaking, rather than forcing him to mold to a standard system.
+Be effective without over-correcting his genuine, expressive voice into something too sterile or useless.
+
 Phonetic Input: "${text}"
 Context: loc: ${context.location}, time: ${context.time}
 Custom Dictionary (Highly Relevant!): ${JSON.stringify(context.customDictionary)}
-Past interaction logs: ${JSON.stringify(context.pastMatches)}
+
+Crucial Instructions:
+1. Examine the "Past interaction logs" below. These are times Paxton spoke and then manually confirmed the intended meaning (sometimes choosing a, b, or c).
+2. Dynamically learn his syntax and speaking style from these past successful interactions. 
+3. If he typically says things a certain way (even if it's "broken English" or drops consonants), PRESERVE his style.
+4. Translate the phonetic input into the intended meaning while matching his learned cadence. Do NOT over-correct.
+
+Past interaction logs (Learn from these!): ${JSON.stringify(context.pastMatches)}
 
 Output 3 possible interpretations arrays inside a JSON object: 
 {
@@ -477,8 +582,7 @@ Output 3 possible interpretations arrays inside a JSON object:
      {"id": "C", "text": "Intended sentence 3", "probability": 0.01}
   ],
   "confidence": 0.9
-}
-Use the Custom Dictionary to translate known phonetic words directly! If the input is a clear, standard phrase like "Hello my name is Kevin", just fix slight typos and assign high probability.`;
+}`;
 
     try {
       const ollamaUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';

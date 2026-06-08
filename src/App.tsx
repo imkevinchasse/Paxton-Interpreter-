@@ -71,9 +71,18 @@ export default function App() {
     setResult(null);
   };
 
+  const handleDeleteInteraction = async (id: string) => {
+    try {
+      await fetch(`/api/interactions/${id}`, { method: 'DELETE' });
+      setInteractions(prev => prev.filter(i => i.id !== id));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   return (
     <div className="flex h-screen bg-[#f0f2f5] text-[#1a1c1e] overflow-hidden font-sans">
-      <Sidebar interactions={interactions} currentView={currentView} onViewChange={setCurrentView} />
+      <Sidebar interactions={interactions} currentView={currentView} onViewChange={setCurrentView} onDelete={handleDeleteInteraction} />
       
       <main className="flex-1 flex flex-col relative z-0">
         <header className="h-16 px-8 flex items-center justify-between border-b border-slate-200 bg-white z-10 shrink-0">

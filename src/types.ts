@@ -26,6 +26,7 @@ export interface AppSettings {
   ollamaEndpoint: string;
   llamaModel: string;
   whisperEndpoint: string;
+  speakerIsolationEnabled?: boolean;
 }
 
 export interface TrainingItem {
@@ -35,13 +36,14 @@ export interface TrainingItem {
   sound: string;
   meaning: string;
   hasAudio: boolean;
+  filename?: string;
 }
 
 export interface AudioRecording {
   id: string;
   filename: string;
   timestamp: string;
-  status: 'unprocessed' | 'processed' | 'finalized';
+  status: 'unprocessed' | 'processed' | 'finalized' | 'ignored';
   sound?: string;
   meaning?: string;
   isCut?: boolean;

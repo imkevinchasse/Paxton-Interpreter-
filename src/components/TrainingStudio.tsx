@@ -108,7 +108,7 @@ export function TrainingStudio() {
       <div className="flex-1 space-y-6">
         <div className="space-y-2">
           <h2 className="text-2xl font-bold text-slate-800 tracking-tight flex items-center gap-2">
-            <ListPlus className="w-6 h-6 text-indigo-600" /> Training Studio
+            <ListPlus className="w-6 h-6 text-indigo-600" /> Intended Words
           </h2>
           <p className="text-slate-500 text-sm">
             Record words, phrases, or letters. Provide the phonetic spelling and the actual intent to collect data for fine-tuning Whisper.
@@ -253,7 +253,10 @@ export function TrainingStudio() {
          </div>
 
          <div className="space-y-4 pt-4 border-t border-slate-200">
-           <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Recently Added</h3>
+           <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider flex justify-between items-center">
+             Recently Added 
+             <span className="text-xs text-slate-500 lowercase font-mono bg-slate-100 px-2 py-0.5 rounded-md">{savedItems.length} samples</span>
+           </h3>
            {savedItems.length === 0 && (
              <p className="text-xs text-slate-500 font-mono bg-white p-4 border border-slate-200 border-dashed rounded-xl text-center">No data collected this session.</p>
            )}
@@ -263,7 +266,19 @@ export function TrainingStudio() {
                   <div className="flex justify-between items-center">
                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{item.category}</span>
                      <div className="flex items-center space-x-2">
-                       {item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
+                       {item.filename && (
+                         <button 
+                           onClick={() => {
+                             const audio = new Audio(`/api/training_data/audio/${item.filename}`);
+                             audio.play();
+                           }}
+                           className="text-slate-400 hover:text-indigo-500 transition-colors"
+                           title="Play Original Audio"
+                         >
+                           <Mic className="w-4 h-4" />
+                         </button>
+                       )}
+                       {!item.filename && item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
                        <button onClick={() => handleDelete(item.id)} className="text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100">
                          <Trash2 className="w-4 h-4" />
                        </button>

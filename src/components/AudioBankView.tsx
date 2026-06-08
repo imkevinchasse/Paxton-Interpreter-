@@ -5,7 +5,7 @@ import { motion } from 'motion/react';
 
 export function AudioBankView() {
   const [recordings, setRecordings] = useState<AudioRecording[]>([]);
-  const [activeTab, setActiveTab] = useState<'unfinalized' | 'finalized'>('unfinalized');
+  const [activeTab, setActiveTab] = useState<'unfinalized' | 'finalized' | 'ignored'>('unfinalized');
   
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -100,8 +100,22 @@ export function AudioBankView() {
     }
   };
 
+  const handleIgnore = async (id: string) => {
+    try {
+      const res = await fetch(`/api/audio_bank/${id}/ignore`, { method: 'PUT' });
+      const data = await res.json();
+      setRecordings(recordings.map(r => r.id === id ? data : r));
+      setFinalizingId(null);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   const unfinalized = recordings.filter(r => r.status === 'unprocessed' || r.status === 'processed');
   const finalized = recordings.filter(r => r.status === 'finalized');
+  const ignored = recordings.filter(r => r.status === 'ignored');
+
+  const activeItems = activeTab === 'unfinalized' ? unfinalized : activeTab === 'finalized' ? finalized : ignored;
 
   return (
     <div className="w-full max-w-5xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -156,17 +170,27 @@ export function AudioBankView() {
           >
             Finalized & Trained ({finalized.length})
           </button>
+          <button 
+            onClick={() => setActiveTab('ignored')}
+            className={`px-8 py-4 text-sm font-bold uppercase tracking-wider transition-colors border-b-2 ${
+              activeTab === 'ignored' 
+                ? 'border-amber-600 text-amber-600 bg-white' 
+                : 'border-transparent text-slate-500 hover:text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            Ignored ({ignored.length})
+          </button>
         </div>
 
         <div className="p-6">
           <div className="space-y-4">
-            {(activeTab === 'unfinalized' ? unfinalized : finalized).length === 0 && (
+            {activeItems.length === 0 && (
               <div className="text-center text-slate-400 font-mono text-sm py-12 border border-slate-200 border-dashed rounded-xl bg-slate-50">
                 No audio recordings in this category.
               </div>
             )}
 
-            {(activeTab === 'unfinalized' ? unfinalized : finalized).map((audio) => (
+            {activeItems.map((audio) => (
                <motion.div 
                  key={audio.id}
                  layout
@@ -268,12 +292,30 @@ export function AudioBankView() {
                         </button>
                       )}
                       {audio.status === 'processed' && finalizingId !== audio.id && (
-                        <button 
-                          onClick={() => setFinalizingId(audio.id)}
-                          className="flex items-center gap-2 px-4 py-2 bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 rounded-lg text-xs font-bold shadow-sm transition-colors"
-                        >
-                          <CheckCircle className="w-3 h-3" /> Write Standard (Finalize)
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button 
+                            onClick={() => {
+                              const a = new Audio(`/api/training_data/audio/${audio.filename}`);
+                              a.play();
+                            }}
+                            className="flex items-center gap-2 px-4 py-2 bg-slate-50 border border-slate-200 text-slate-700 hover:bg-slate-100 rounded-lg text-xs font-bold shadow-sm transition-colors"
+                            title="Play Audio Fragment"
+                          >
+                            <PlayCircle className="w-3 h-3" /> Play
+                          </button>
+                          <button 
+                            onClick={() => { setFinalizingId(audio.id); setSound(audio.sound || ''); setMeaning(audio.meaning || ''); }}
+                            className="flex items-center gap-2 px-4 py-2 bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 rounded-lg text-xs font-bold shadow-sm transition-colors"
+                          >
+                            <CheckCircle className="w-3 h-3" /> Write Standard (Finalize)
+                          </button>
+                          <button 
+                            onClick={() => handleIgnore(audio.id)}
+                            className="flex items-center gap-2 px-4 py-2 bg-amber-50 border border-amber-200 text-amber-700 hover:bg-amber-100 rounded-lg text-xs font-bold shadow-sm transition-colors"
+                          >
+                            <X className="w-3 h-3" /> Skip
+                          </button>
+                        </div>
                       )}
                     </div>
                     <div className="flex items-center gap-2">

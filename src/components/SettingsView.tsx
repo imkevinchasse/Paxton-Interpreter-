@@ -98,7 +98,7 @@ export function SettingsView() {
 
         <div className="bg-white rounded-2xl border border-slate-200 p-8 shadow-sm space-y-6">
           <div className="space-y-4">
-            <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Ollama Settings (Llama 3)</h3>
+            <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Ollama Settings</h3>
             
             <div className="space-y-2">
               <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Ollama Endpoint URL</label>
@@ -112,21 +112,52 @@ export function SettingsView() {
             </div>
 
             <div className="space-y-2">
-              <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Llama Model Name</label>
+              <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">LLM Model Name</label>
               <input 
                 type="text" 
+                list="ollama-models"
                 value={settings.llamaModel}
                 onChange={e => setSettings({ ...settings, llamaModel: e.target.value })}
                 className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all text-sm font-mono shadow-inner"
                 placeholder="llama3"
               />
+              <datalist id="ollama-models">
+                <option value="llama3" />
+                <option value="gemma:2b" />
+                <option value="gemma:4b" />
+                <option value="gemma:7b" />
+                <option value="phi3" />
+                <option value="mistral" />
+                <option value="qwen:1.8b" />
+                <option value="qwen:4b" />
+                <option value="llama3:instruct-q4" />
+                <option value="gemma:2b-instruct-q4" />
+              </datalist>
+              <p className="text-xs text-slate-400 mt-2">
+                 Type any Ollama model name tag. Suggested light models: <code>gemma:2b</code>, <code>phi3</code>, or <code>qwen</code>.
+              </p>
             </div>
           </div>
 
           <div className="border-t border-slate-100 pt-6 space-y-4">
             <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Whisper STT Settings</h3>
             
-            <div className="space-y-2">
+            <div className="space-y-4">
+               <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Speaker Isolation / Voice Profile</h3>
+                    <p className="text-xs text-slate-500 mt-1">Differentiate voices. Isolates target voice and removes cross-talk/interruptions from others. Preserves loud/rough voice variations of the target.</p>
+                  </div>
+                  <button 
+                    onClick={() => setSettings(s => ({ ...s, speakerIsolationEnabled: !s.speakerIsolationEnabled }))}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${settings.speakerIsolationEnabled ? 'bg-emerald-500' : 'bg-slate-300'}`}
+                  >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${settings.speakerIsolationEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                  </button>
+               </div>
+            </div>
+
+            <div className="space-y-2 pt-2">
               <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Whisper Gateway URL</label>
               <input 
                  type="text" 

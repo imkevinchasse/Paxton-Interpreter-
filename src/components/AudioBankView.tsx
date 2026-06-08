@@ -74,9 +74,10 @@ export function AudioBankView() {
 
   const handleProcess = async (id: string) => {
     try {
-      const res = await fetch(`/api/audio_bank/${id}/process`, { method: 'POST' });
+      await fetch(`/api/audio_bank/${id}/process`, { method: 'POST' });
+      const res = await fetch('/api/audio_bank');
       const data = await res.json();
-      setRecordings(recordings.map(r => r.id === id ? data : r));
+      setRecordings(data);
     } catch (e) {
       console.error(e);
     }

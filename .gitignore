@@ -6,3 +6,18 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# App data
+db.json
+training_data.json
+settings.json
+optimized_context.json
+audio_bank.json
+audio_bank/
+audio/
+uploads/
+
+# Models and C++ code
+whisper.cpp/
+models/
+.backup/

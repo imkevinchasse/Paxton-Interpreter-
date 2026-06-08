@@ -253,15 +253,20 @@ app.post('/api/audio_bank/:id/process', async (req, res) => {
               const stats = fs.statSync(trimmedPath);
               if (stats.size > 4096) {
                  const guess = await WhisperEngine.transcribe(trimmedPath);
+                 const newFilename = audio.filename.replace(/\.[^/.]+$/, "") + `_snippet_${newItems.length + 1}.wav`;
+                 const finalPath = path.join(dir, newFilename);
+                 fs.renameSync(trimmedPath, finalPath);
                  newItems.push({
                    id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
-                   filename: audio.filename.replace(/\.[^/.]+$/, "") + `_snippet_${newItems.length + 1}.wav`,
-                   path: trimmedPath,
+                   filename: newFilename,
+                   path: finalPath,
                    timestamp: new Date().toISOString(),
                    status: 'processed' as const,
                    sound: guess,
                    isCut: true
                  });
+              } else {
+                 if (fs.existsSync(trimmedPath)) fs.unlinkSync(trimmedPath);
               }
               fs.unlinkSync(chunkPath);
            }
@@ -290,9 +295,13 @@ app.post('/api/audio_bank/:id/process', async (req, res) => {
            return res.status(400).json({ error: "Audio was only silence and was deleted." });
         }
         
-        audio.path = outputPath;
-        audio.filename = audio.filename + '_cut.wav';
-        audio.sound = await WhisperEngine.transcribe(outputPath);
+         const newFilename = audio.filename.replace(/\.[^/.]+$/, "") + '_cut.wav';
+         const finalPath = path.join(path.dirname(audio.path), newFilename);
+         fs.renameSync(outputPath, finalPath);
+         
+         audio.path = finalPath;
+         audio.filename = newFilename;
+         audio.sound = await WhisperEngine.transcribe(finalPath);
       } catch (e) {
         console.error("FFmpeg processing failed", e);
       }

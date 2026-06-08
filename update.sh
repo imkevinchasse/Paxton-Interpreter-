@@ -19,9 +19,10 @@ else
 fi
 
 # Files to protect from being overwritten
-PROTECTED_FILES=("db.json" "training_data.json" "settings.json" "optimized_context.json" "audio_bank" "whisper.cpp" "models" "audio")
+PROTECTED_FILES=("db.json" "training_data.json" "settings.json" "optimized_context.json" "audio_bank.json" "audio_bank" "whisper.cpp" "models" "audio" "uploads" ".env")
 
 echo "📦 Backing up protected data..."
+# Use a backup dir outside of git's view or explicitly excluded
 mkdir -p .backup
 for file in "${PROTECTED_FILES[@]}"; do
   if [ -e "$file" ]; then
@@ -32,7 +33,7 @@ done
 echo "📥 Synchronizing with source..."
 # Overwrite local uncommitted changes except our backups
 git reset --hard origin/$BRANCH || echo "Failed to pull changes."
-git clean -fd
+git clean -fd -e .backup -e db.json -e training_data.json -e settings.json -e optimized_context.json -e audio_bank.json -e audio_bank -e whisper.cpp -e models -e audio -e uploads -e .env
 
 echo "🛡️ Restoring protected data..."
 for file in "${PROTECTED_FILES[@]}"; do
@@ -49,4 +50,4 @@ npm install
 echo "🔨 Rebuilding applet..."
 npm run build
 
-echo "✅ Update complete! Please restart your app to apply."
+echo "✅ Update complete! If run.sh is currently running, the system will automatically reload the changes."

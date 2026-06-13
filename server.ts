@@ -563,11 +563,15 @@ app.post('/api/train-models', async (req, res) => {
     let sampleCount = 0;
     
     for (const t of trainingData) {
-       if (t.hasAudio && t.audioPath && fs.existsSync(t.audioPath)) {
-          const ext = path.extname(t.audioPath);
+       let audioFile = t.audioPath;
+       if (!audioFile && t.filename) {
+          audioFile = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', t.filename);
+       }
+       if (t.hasAudio && audioFile && fs.existsSync(audioFile)) {
+          const ext = path.extname(audioFile);
           const newName = `audio_${t.id}${ext}`;
           const destPath = path.join(datasetDir, newName);
-          fs.copyFileSync(t.audioPath, destPath);
+          fs.copyFileSync(audioFile, destPath);
           
           const escapedPhonetic = (t.sound || "").replace(/"/g, '""');
           const escapedTranscription = (t.meaning || "").replace(/"/g, '""');

@@ -188,32 +188,73 @@ app.post('/api/dictionary', (req, res) => {
   res.json(item);
 });
 
+let builderState = {
+  isBuilding: false,
+  totalItems: 0,
+  processedItems: 0,
+  currentItem: ''
+};
+
+app.get('/api/dictionary/build/status', (req, res) => {
+  res.json(builderState);
+});
+
 app.post('/api/dictionary/build', async (req, res) => {
-  console.log(`\n[🔍 DICTIONARY BUILDER INITIATED]`);
+  if (builderState.isBuilding) {
+    return res.status(400).json({ success: false, message: 'Build already in progress' });
+  }
+  
+  const force = req.query.force === 'true' || req.body?.force === true;
+  
+  const toProcess = [];
+  for (const t of trainingData) {
+     if (t.sound && t.meaning && (!t.dictProcessed || force)) {
+        toProcess.push({ source: t, sound: t.sound, meaning: t.meaning, type: 'training' });
+     }
+  }
+  // Include finalized interactions
+  for (const i of interactions) {
+     if (i.whisper_guess && i.finalText && (!i.dictProcessed || force)) {
+        toProcess.push({ source: i, sound: i.whisper_guess, meaning: i.finalText, type: 'interaction' });
+     }
+  }
+  
+  if (toProcess.length === 0) {
+    return res.json({ success: false, message: 'No new items to process' });
+  }
+  
+  builderState.isBuilding = true;
+  builderState.totalItems = toProcess.length;
+  builderState.processedItems = 0;
+  
+  console.log(`\n[🔍 DICTIONARY BUILDER INITIATED] Processing ${toProcess.length} items`);
   res.status(202).json({ success: true, message: 'Dictionary build started in background' });
   
   // Background processing
   const ollamaUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
   
-  for (const t of trainingData) {
-     if (!t.sound || !t.meaning) continue;
-     
-     const promptText = `I am building a dictionary for a phonetic translation system. 
-The phonetic transcription is: "${t.sound}"
-The actual intended meaning is: "${t.meaning}"
+  for (const item of toProcess) {
+     builderState.currentItem = item.sound;
+     const promptText = `I am building a comprehensive phonetic dictionary to map raw, atypical speech sounds to standard English.
+The phonetic transcription (exact spoken words) is: "${item.sound}"
+The actual intended meaning (what was meant) is: "${item.meaning}"
 
-Analyze this pair. Extract any "atypical words or sentences" where the phonetic spelling significantly diverges from standard spelling, or where there's a unique slang/pattern. 
-For each unique atypical word or phrase you find, output a JSON array of objects representing dictionary entries.
-Each object should have:
-"word": The phonetic sound,
-"definition": The intended standard word or meaning,
-"context": The full phrase for context.
+Analyze the pair word-by-word and phrase-by-phrase. Break down the sentence.
+Identify where the phonetic spelling differs from the intended meaning. 
+Create entries for individual words (e.g., "wor" -> "word") AND multi-word phrases if the meaning only makes sense when the words are together (e.g., "nee hell" -> "need help").
+Even if you have to infer or deduce the mapping based on context, provide your best mapping for every unique sound-to-meaning pair.
 
-Output ONLY valid JSON. If nothing is atypical, return [].
-Example: [{"word": "ba-man", "definition": "batman", "context": "I like ba-man"}]`;
+Output a JSON array of objects representing dictionary entries.
+Format MUST be exactly:
+[
+  {"word": "phonetic word or phrase", "definition": "intended meaning", "context": "the full phrase for context"}
+]
+Example: [{"word": "wor", "definition": "word", "context": "i nee a wor"}, {"word": "nee hell", "definition": "need help", "context": "i nee hell"}]
+Return ONLY the raw JSON array, with no other text.`;
 
+     let success = false;
      try {
-       console.log(`--> Analyzing training item for dictionary: "${t.sound}"`);
+       console.log(`--> Analyzing item for dictionary: "${item.sound}"`);
        const llmRes = await fetch(`${ollamaUrl}/api/generate`, {
          method: 'POST',
          headers: { 'Content-Type': 'application/json' },
@@ -226,17 +267,27 @@ Example: [{"word": "ba-man", "definition": "batman", "context": "I like ba-man"}
        });
        if (llmRes.ok) {
          const data = await llmRes.json();
-         let parsed = JSON.parse(data.response);
+         let parsed = [];
+         try {
+           let cleanText = data.response;
+           const jsonMatch = cleanText.match(/\[[\s\S]*\]/);
+           if (jsonMatch) cleanText = jsonMatch[0];
+           parsed = JSON.parse(cleanText);
+           success = true; // Mark as successful even if empty array
+         } catch(err) {
+           console.log(`JSON parse error on LLM response. Skipping.`);
+         }
+         
          if (!Array.isArray(parsed)) parsed = [];
          
          for(const ent of parsed) {
             // deduplicate checking by word
-            if (!dictionaryData.find(d => d.word.toLowerCase() === ent.word.toLowerCase())) {
+            if (ent.word && ent.definition && !dictionaryData.find(d => d.word.toLowerCase() === ent.word.toLowerCase())) {
                dictionaryData.unshift({
                  id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
                  word: ent.word,
                  definition: ent.definition,
-                 context: ent.context || t.sound
+                 context: ent.context || item.sound
                });
                saveDictionaryData();
                console.log(`    [+] Added dictionary word: "${ent.word}" => "${ent.definition}"`);
@@ -246,7 +297,18 @@ Example: [{"word": "ba-man", "definition": "batman", "context": "I like ba-man"}
      } catch (e) {
        console.log("Error analyzing for dictionary:", e);
      }
+     
+     if (success) {
+       item.source.dictProcessed = true;
+       if (item.type === 'training') saveTrainingData();
+       else saveDb();
+     }
+     
+     builderState.processedItems++;
   }
+  
+  builderState.isBuilding = false;
+  builderState.currentItem = '';
   console.log(`\n[✅ DICTIONARY BUILDER COMPLETE]`);
 });
 

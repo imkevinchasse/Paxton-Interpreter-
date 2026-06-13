@@ -20,6 +20,7 @@ export interface Interaction extends PipelineResult {
   timestamp: string;
   selectedId: string | null;
   finalText: string;
+  dictProcessed?: boolean;
 }
 
 export interface AppSettings {
@@ -43,6 +44,8 @@ export interface TrainingItem {
   meaning: string;
   hasAudio: boolean;
   filename?: string;
+  audioPath?: string;
+  dictProcessed?: boolean;
 }
 
 export interface AudioRecording {

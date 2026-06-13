@@ -554,7 +554,6 @@ app.post('/api/train-models', async (req, res) => {
       fs.writeFileSync('optimized_context.json', JSON.stringify(mappedContexts, null, 2));
     }
 
-    const { spawn } = require('child_process');
     const datasetDir = path.join(process.cwd(), 'dataset');
     if (!fs.existsSync(datasetDir)) {
        fs.mkdirSync(datasetDir);
@@ -680,7 +679,7 @@ app.post('/api/interactions', (req, res) => {
 // Core Local Architecture (Modular Core)
 // -----------------------------------------------------
 
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import util from 'util';
 const execAsync = util.promisify(exec);
 

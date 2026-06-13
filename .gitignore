@@ -10,14 +10,21 @@ coverage/
 # App data
 db.json
 training_data.json
+dictionary.json
 settings.json
 optimized_context.json
 audio_bank.json
 audio_bank/
 audio/
 uploads/
+dataset/
 
-# Models and C++ code
+# Models, C++ code, and Training
 whisper/
 models/
 .backup/
+venv_train/
+whisper-paxton-*/
+whisper-paxton-checkpoints/
+whisper-paxton-final/
+training.log

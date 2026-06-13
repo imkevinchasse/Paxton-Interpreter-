@@ -29,10 +29,15 @@ const upload = multer({ storage });
 let interactions: any[] = [];
 let appSettings: any = {
   ollamaEndpoint: 'http://localhost:11434',
-  llamaModel: 'llama3',
-  whisperEndpoint: 'http://localhost:8080'
+  llamaInterpreterModel: 'llama3',
+  llamaDictionaryModel: 'llama3',
+  whisperEndpoint: 'http://localhost:8080',
+  trainingEpochs: 10,
+  trainingLR: '1e-5',
+  trainingBatchSize: 4
 };
 let trainingData: any[] = [];
+let dictionaryData: any[] = [];
 
 try {
   if (fs.existsSync('db.json')) {
@@ -49,6 +54,12 @@ try {
 try {
   if (fs.existsSync('training_data.json')) {
     trainingData = JSON.parse(fs.readFileSync('training_data.json', 'utf-8'));
+  }
+} catch(e) {}
+
+try {
+  if (fs.existsSync('dictionary.json')) {
+    dictionaryData = JSON.parse(fs.readFileSync('dictionary.json', 'utf-8'));
   }
 } catch(e) {}
 
@@ -74,6 +85,11 @@ function saveTrainingData() {
   fs.writeFileSync('training_data.json', JSON.stringify(trainingData, null, 2));
 }
 
+function saveDictionaryData() {
+  if (isStorageDisabled) return;
+  fs.writeFileSync('dictionary.json', JSON.stringify(dictionaryData, null, 2));
+}
+
 function saveAudioBank() {
   if (isStorageDisabled) return;
   fs.writeFileSync('audio_bank.json', JSON.stringify(audioBank, null, 2));
@@ -96,13 +112,15 @@ app.post('/api/settings/storage', (req, res) => {
 });
 
 app.post('/api/sync-data', (req, res) => {
-  const { interactions: newInteractions, trainingData: newTraining, audioBank: newAudio } = req.body;
+  const { interactions: newInteractions, trainingData: newTraining, audioBank: newAudio, dictionaryData: newDict } = req.body;
   if (newInteractions) interactions = newInteractions;
   if (newTraining) trainingData = newTraining;
   if (newAudio) audioBank = newAudio;
+  if (newDict) dictionaryData = newDict;
   saveDb();
   saveTrainingData();
   saveAudioBank();
+  saveDictionaryData();
   console.log(`\n[🔄 DATA SYNC] Data and state synchronized from remote host.`);
   res.json({ success: true, message: 'Data synced successfully' });
 });
@@ -141,9 +159,95 @@ app.post('/api/settings', (req, res) => {
   saveSettings();
   console.log(`\n[⚙️ SETTINGS UPDATED]`);
   console.log(`--> Ollama Endpoint: ${appSettings.ollamaEndpoint}`);
-  console.log(`--> Llama Model: ${appSettings.llamaModel}`);
+  console.log(`--> Interpreter Llama Model: ${appSettings.llamaInterpreterModel}`);
+  console.log(`--> Dictionary Llama Model: ${appSettings.llamaDictionaryModel}`);
   console.log(`--> Whisper Gateway: ${appSettings.whisperEndpoint}`);
   res.json(appSettings);
+});
+
+app.get('/api/dictionary', (req, res) => {
+  res.json(dictionaryData);
+});
+
+app.delete('/api/dictionary/:id', (req, res) => {
+  const id = req.params.id;
+  dictionaryData = dictionaryData.filter(d => d.id !== id);
+  saveDictionaryData();
+  res.json({ success: true });
+});
+
+app.post('/api/dictionary', (req, res) => {
+  const item = {
+    id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
+    word: req.body.word,
+    definition: req.body.definition,
+    context: req.body.context
+  };
+  dictionaryData.unshift(item);
+  saveDictionaryData();
+  res.json(item);
+});
+
+app.post('/api/dictionary/build', async (req, res) => {
+  console.log(`\n[🔍 DICTIONARY BUILDER INITIATED]`);
+  res.status(202).json({ success: true, message: 'Dictionary build started in background' });
+  
+  // Background processing
+  const ollamaUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
+  
+  for (const t of trainingData) {
+     if (!t.sound || !t.meaning) continue;
+     
+     const promptText = `I am building a dictionary for a phonetic translation system. 
+The phonetic transcription is: "${t.sound}"
+The actual intended meaning is: "${t.meaning}"
+
+Analyze this pair. Extract any "atypical words or sentences" where the phonetic spelling significantly diverges from standard spelling, or where there's a unique slang/pattern. 
+For each unique atypical word or phrase you find, output a JSON array of objects representing dictionary entries.
+Each object should have:
+"word": The phonetic sound,
+"definition": The intended standard word or meaning,
+"context": The full phrase for context.
+
+Output ONLY valid JSON. If nothing is atypical, return [].
+Example: [{"word": "ba-man", "definition": "batman", "context": "I like ba-man"}]`;
+
+     try {
+       console.log(`--> Analyzing training item for dictionary: "${t.sound}"`);
+       const llmRes = await fetch(`${ollamaUrl}/api/generate`, {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+           model: appSettings.llamaDictionaryModel || 'llama3',
+           prompt: promptText,
+           stream: false,
+           format: 'json'
+         })
+       });
+       if (llmRes.ok) {
+         const data = await llmRes.json();
+         let parsed = JSON.parse(data.response);
+         if (!Array.isArray(parsed)) parsed = [];
+         
+         for(const ent of parsed) {
+            // deduplicate checking by word
+            if (!dictionaryData.find(d => d.word.toLowerCase() === ent.word.toLowerCase())) {
+               dictionaryData.unshift({
+                 id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
+                 word: ent.word,
+                 definition: ent.definition,
+                 context: ent.context || t.sound
+               });
+               saveDictionaryData();
+               console.log(`    [+] Added dictionary word: "${ent.word}" => "${ent.definition}"`);
+            }
+         }
+       }
+     } catch (e) {
+       console.log("Error analyzing for dictionary:", e);
+     }
+  }
+  console.log(`\n[✅ DICTIONARY BUILDER COMPLETE]`);
 });
 
 app.get('/api/training_data', (req, res) => {
@@ -360,7 +464,8 @@ app.post('/api/audio_bank/:id/finalize', (req, res) => {
       category: 'Phrase',
       sound: audio.sound,
       meaning: audio.meaning,
-      hasAudio: true
+      hasAudio: true,
+      audioPath: audio.path
     };
     trainingData.unshift(trainingItem);
     saveTrainingData();
@@ -387,42 +492,58 @@ app.post('/api/train-models', async (req, res) => {
       fs.writeFileSync('optimized_context.json', JSON.stringify(mappedContexts, null, 2));
     }
 
-    let compiledCount = 0;
-    // Process all audio bank recordings that are unprocessed
-    for (const audio of audioBank.filter(a => a.status === 'unprocessed' && a.path)) {
-      if (fs.existsSync(audio.path)) {
-        const outputPath = `${audio.path}_opt.wav`;
-        try {
-          await execAsync(`ffmpeg -y -i "${audio.path}" -ar 16000 -ac 1 -c:a pcm_s16le "${outputPath}"`);
-          audio.path = outputPath;
-          audio.status = 'processed';
-          compiledCount++;
-        } catch(e) {}
-      }
+    const { spawn } = require('child_process');
+    const datasetDir = path.join(process.cwd(), 'dataset');
+    if (!fs.existsSync(datasetDir)) {
+       fs.mkdirSync(datasetDir);
     }
-    saveAudioBank();
-
-    let message = 'Datasets compiled and audio optimized successfully.';
     
-    console.log(`[📊] Validating dataset depth for Whisper fine-tuning...`);
-    if (trainingData.length < 500) {
-      console.log(`[⚠️] Whisper fine-tuning deferred. Need at least 500 samples for stable training (current: ${trainingData.length})`);
-      console.log(`--> Collecting ${500 - trainingData.length} more proper training data points before core model finetune.`);
-      message += ` (Whisper training deferred: ${trainingData.length}/500 samples required)`;
-    } else {
-      console.log(`[🔥] Minimum sample threshold met (${trainingData.length}/500).`);
-      console.log(`--> Generating dataset manifest for MLX-Whisper...`);
-      // Simulating the mlx-whisper finetune process since it runs out-of-band
-      console.log(`--> Injecting specific Hyperparameters for Paxton's Profile:`);
-      console.log(`    * dynamic_time_warping: enabled (to handle slurred/run-on words)`);
-      console.log(`    * consonant_dropout_tolerance: adaptive (handles excited speech drops)`);
-      console.log(`    * early_stopping_patience: high (prevents overtraining)`);
-      console.log(`    * cross_entropy_smoothing: 0.15 (prevents undertraining/rigid fits)`);
-      console.log(`--> Triggering Apple Silicon MLX GPU Fine-Tuning process for parameter updates...`);
-      console.log(`--> Training Whisper model gradually via LoRA. Loss curves logged locally.`);
-      message += ` Whisper MLP model training session initiated using MLX with Paxton's custom hyperparams!`;
+    const csvContent = ["file_name,transcription,phonetic,intent"];
+    let sampleCount = 0;
+    
+    for (const t of trainingData) {
+       if (t.hasAudio && t.audioPath && fs.existsSync(t.audioPath)) {
+          const ext = path.extname(t.audioPath);
+          const newName = `audio_${t.id}${ext}`;
+          const destPath = path.join(datasetDir, newName);
+          fs.copyFileSync(t.audioPath, destPath);
+          
+          const escapedPhonetic = (t.sound || "").replace(/"/g, '""');
+          const escapedTranscription = (t.meaning || "").replace(/"/g, '""');
+          const escapedIntent = (t.category || "").replace(/"/g, '""');
+          
+          csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
+          sampleCount++;
+       }
     }
+    
+    fs.writeFileSync(path.join(datasetDir, "metadata.csv"), csvContent.join("\n"));
+    console.log(`[📊] Exported ${sampleCount} real audio samples to dataset/metadata.csv`);
+    
+    if (sampleCount < 5) {
+       console.log(`[⚠️] Not enough audio samples for a meaningful test. Please finalize at least 5 audio items.`);
+       return res.json({ success: false, message: `Need at least 5 audio samples to begin (Current: ${sampleCount}). Finalize more in the pipeline.` });
+    }
+    
+    console.log(`--> Spawning Python training pipeline to actually finetune Whisper...`);
+    
+    // Ensure scripts are executable
+    if (fs.existsSync('run_training.sh')) {
+       fs.chmodSync('run_training.sh', 0o755);
+    }
+    
+    const transcriptMode = appSettings.trainingMode || 'phonetic';
+    
+    const trainProcess = spawn('bash', [
+       'run_training.sh', 
+       (appSettings.trainingEpochs || 15).toString(), 
+       (appSettings.trainingLR || '5e-6').toString(),
+       (appSettings.trainingBatchSize || 8).toString(),
+       transcriptMode
+    ], { cwd: process.cwd(), detached: true, stdio: 'ignore' });
+    trainProcess.unref();
 
+    let message = `Real Whisper training session initiated on ${sampleCount} samples using Python/HuggingFace! Check training.log for live progress.`;
     res.json({ success: true, message: message });
   } catch(e) {
     console.error("Dataset optimization failed", e);
@@ -537,7 +658,19 @@ class RetrievalMemory {
   static async search(text: string) {
     const keywords = text.toLowerCase().split(/\s+/).filter(w => w.length > 2);
     
-    // 1. Search Custom Dictionary (trainingData)
+    // 1. Search Dictionary (dictionaryData)
+    const scoredDict = dictionaryData.map(d => {
+       let score = 0;
+       const wordLower = (d.word || "").toLowerCase();
+       keywords.forEach(kw => {
+          if (wordLower.includes(kw)) score++;
+       });
+       return { item: d, score };
+    });
+    scoredDict.sort((a,b) => b.score - a.score);
+    const topDictMatches = scoredDict.filter(s => s.score > 0).slice(0, 3).map(s => s.item);
+
+    // 2. Search Custom Dictionary (trainingData)
     const scoredTraining = trainingData.map(t => {
       let score = 0;
       const soundLower = (t.sound || "").toLowerCase();
@@ -571,7 +704,8 @@ class RetrievalMemory {
 
     return { 
       location: "local device", 
-      time: timeOfDay, 
+      time: timeOfDay,
+      dictionary: topDictMatches,
       customDictionary: topTrainingMatches,
       pastMatches: topPastInteractions 
     };
@@ -591,6 +725,7 @@ Be effective without over-correcting his genuine, expressive voice into somethin
 
 Phonetic Input: "${text}"
 Context: loc: ${context.location}, time: ${context.time}
+Learned Words Dictionary: ${JSON.stringify(context.dictionary)}
 Custom Dictionary (Highly Relevant!): ${JSON.stringify(context.customDictionary)}
 
 Crucial Instructions:
@@ -617,7 +752,7 @@ Output 3 possible interpretations arrays inside a JSON object:
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-           model: appSettings.llamaModel || 'llama3',
+           model: appSettings.llamaInterpreterModel || 'llama3',
            prompt: promptText,
            stream: false,
            format: 'json'

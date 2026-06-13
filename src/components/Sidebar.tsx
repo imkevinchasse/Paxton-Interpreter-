@@ -1,5 +1,5 @@
 import { type Interaction, type ViewState } from '../types';
-import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2 } from 'lucide-react';
+import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA } from 'lucide-react';
 
 interface SidebarProps { 
   interactions: Interaction[];
@@ -55,6 +55,17 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
             }`}
           >
             <FileAudio className="w-4 h-4" /> Audio Pipeline
+          </button>
+          
+          <button 
+            onClick={() => onViewChange('dictionary')}
+            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
+              currentView === 'dictionary' 
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <BookA className="w-4 h-4" /> Dictionary
           </button>
           
           <button 

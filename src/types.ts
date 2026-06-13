@@ -25,8 +25,14 @@ export interface Interaction extends PipelineResult {
 export interface AppSettings {
   ollamaEndpoint: string;
   llamaModel: string;
+  llamaInterpreterModel?: string;
+  llamaDictionaryModel?: string;
   whisperEndpoint: string;
   speakerIsolationEnabled?: boolean;
+  trainingEpochs?: number;
+  trainingLR?: string;
+  trainingBatchSize?: number;
+  trainingMode?: string;
 }
 
 export interface TrainingItem {
@@ -49,4 +55,11 @@ export interface AudioRecording {
   isCut?: boolean;
 }
 
-export type ViewState = 'interpreter' | 'training' | 'settings' | 'audiobank';
+export interface DictionaryItem {
+  id: string;
+  word: string;
+  definition: string;
+  context?: string;
+}
+
+export type ViewState = 'interpreter' | 'training' | 'settings' | 'audiobank' | 'dictionary';

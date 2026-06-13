@@ -5,6 +5,7 @@ import { ProcessingView, HighConfidenceView, MediumConfidenceView, LowConfidence
 import { SettingsView } from './components/SettingsView';
 import { TrainingStudio } from './components/TrainingStudio';
 import { AudioBankView } from './components/AudioBankView';
+import { DictionaryView } from './components/DictionaryView';
 import { type Interaction, type PipelineResult, type ViewState } from './types';
 
 export default function App() {
@@ -119,6 +120,10 @@ export default function App() {
 
            {currentView === 'audiobank' && (
              <AudioBankView />
+           )}
+
+           {currentView === 'dictionary' && (
+             <DictionaryView />
            )}
 
            {currentView === 'settings' && (

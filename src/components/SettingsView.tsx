@@ -6,7 +6,12 @@ export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings>({
     ollamaEndpoint: '',
     llamaModel: '',
-    whisperEndpoint: ''
+    llamaInterpreterModel: '',
+    llamaDictionaryModel: '',
+    whisperEndpoint: '',
+    trainingEpochs: 10,
+    trainingLR: '1e-5',
+    trainingBatchSize: 4
   });
   const [saved, setSaved] = useState(false);
   const [storageDisabled, setStorageDisabled] = useState(false);
@@ -111,16 +116,31 @@ export function SettingsView() {
               />
             </div>
 
-            <div className="space-y-2">
-              <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">LLM Model Name</label>
-              <input 
-                type="text" 
-                list="ollama-models"
-                value={settings.llamaModel}
-                onChange={e => setSettings({ ...settings, llamaModel: e.target.value })}
-                className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all text-sm font-mono shadow-inner"
-                placeholder="llama3"
-              />
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Interpreter LLM Model Name</label>
+                <input 
+                  type="text" 
+                  list="ollama-models"
+                  value={settings.llamaInterpreterModel || settings.llamaModel || ''}
+                  onChange={e => setSettings({ ...settings, llamaInterpreterModel: e.target.value })}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all text-sm font-mono shadow-inner"
+                  placeholder="llama3"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Dictionary Builder LLM Model Name</label>
+                <input 
+                  type="text" 
+                  list="ollama-models"
+                  value={settings.llamaDictionaryModel || settings.llamaModel || ''}
+                  onChange={e => setSettings({ ...settings, llamaDictionaryModel: e.target.value })}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all text-sm font-mono shadow-inner"
+                  placeholder="llama3"
+                />
+              </div>
+              
               <datalist id="ollama-models">
                 <option value="llama3" />
                 <option value="gemma:2b" />
@@ -134,8 +154,55 @@ export function SettingsView() {
                 <option value="gemma:2b-instruct-q4" />
               </datalist>
               <p className="text-xs text-slate-400 mt-2">
-                 Type any Ollama model name tag. Suggested light models: <code>gemma:2b</code>, <code>phi3</code>, or <code>qwen</code>.
+                 Assign different models. e.g. A fast lightweight model for Interpreter and a larger smarter model for Dictionary Builder.
               </p>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-100 pt-6 space-y-4">
+            <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider">Whisper Fine-Tuning Hyperparameters</h3>
+            <p className="text-xs text-slate-500">Tune the fallback Python training job when you process &gt;10 datasets</p>
+            
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+               <div className="space-y-2">
+                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Epochs</label>
+                 <input 
+                   type="number" 
+                   value={settings.trainingEpochs || ''}
+                   onChange={e => setSettings({ ...settings, trainingEpochs: parseInt(e.target.value) || 10 })}
+                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 text-sm font-mono shadow-inner"
+                 />
+               </div>
+               <div className="space-y-2">
+                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Learn Rate (LR)</label>
+                 <input 
+                   type="text" 
+                   value={settings.trainingLR || ''}
+                   onChange={e => setSettings({ ...settings, trainingLR: e.target.value })}
+                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 text-sm font-mono shadow-inner"
+                   placeholder="1e-5"
+                 />
+               </div>
+               <div className="space-y-2">
+                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Batch Size</label>
+                 <input 
+                   type="number" 
+                   value={settings.trainingBatchSize || ''}
+                   onChange={e => setSettings({ ...settings, trainingBatchSize: parseInt(e.target.value) || 8 })}
+                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 text-sm font-mono shadow-inner"
+                 />
+               </div>
+               <div className="space-y-2">
+                 <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Transcript Mode</label>
+                 <select
+                   value={settings.trainingMode || 'phonetic'}
+                   onChange={e => setSettings({ ...settings, trainingMode: e.target.value })}
+                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 text-sm font-mono shadow-inner"
+                 >
+                   <option value="phonetic">Phonetic</option>
+                   <option value="english">English</option>
+                 </select>
+               </div>
             </div>
           </div>
 

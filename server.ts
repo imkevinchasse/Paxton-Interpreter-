@@ -527,7 +527,8 @@ app.post('/api/audio_bank/:id/finalize', (req, res) => {
       sound: audio.sound,
       meaning: audio.meaning,
       hasAudio: true,
-      audioPath: audio.path
+      audioPath: audio.path,
+      filename: audio.filename
     };
     trainingData.unshift(trainingItem);
     saveTrainingData();
@@ -564,9 +565,19 @@ app.post('/api/train-models', async (req, res) => {
     
     for (const t of trainingData) {
        let audioFile = t.audioPath;
+       if (audioFile && !fs.existsSync(audioFile)) {
+          // If absolute path moved, fallback to uploads dir
+          const fallbackPath = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', path.basename(audioFile));
+          if (fs.existsSync(fallbackPath)) {
+             audioFile = fallbackPath;
+          } else {
+             audioFile = null;
+          }
+       }
        if (!audioFile && t.filename) {
           audioFile = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', t.filename);
        }
+       
        if (t.hasAudio && audioFile && fs.existsSync(audioFile)) {
           const ext = path.extname(audioFile);
           const newName = `audio_${t.id}${ext}`;
@@ -579,6 +590,8 @@ app.post('/api/train-models', async (req, res) => {
           
           csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
           sampleCount++;
+       } else if (t.hasAudio) {
+          console.log(`[⚠️] Could not locate file: ${t.audioPath || t.filename} (resolved to: ${audioFile})`);
        }
     }
     

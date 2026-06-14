@@ -239,10 +239,10 @@ app.post('/api/dictionary/build', async (req, res) => {
 The phonetic transcription (exact spoken words) is: "${item.sound}"
 The actual intended meaning (what was meant) is: "${item.meaning}"
 
-Analyze the pair word-by-word and phrase-by-phrase. Break down the sentence.
-Identify where the phonetic spelling differs from the intended meaning. 
-Create entries for individual words (e.g., "wor" -> "word") AND multi-word phrases if the meaning only makes sense when the words are together (e.g., "nee hell" -> "need help").
-Even if you have to infer or deduce the mapping based on context, provide your best mapping for every unique sound-to-meaning pair.
+Analyze the pair word-by-word and phrase-by-phrase. Break down the entire sentence.
+Create entries for ALL words and multi-word phrases. You MUST map every part of the phonetic transcription to its intended meaning.
+Even if you have to infer or deduce the mapping based on context, provide your best mapping for every unique sound-to-meaning pair. 
+DO NOT SKIP ANY WORDS. If words must be grouped together to make sense (e.g. "nee hell" -> "need help"), group them.
 
 Output a JSON array of objects representing dictionary entries.
 Format MUST be exactly:
@@ -250,7 +250,7 @@ Format MUST be exactly:
   {"word": "phonetic word or phrase", "definition": "intended meaning", "context": "the full phrase for context"}
 ]
 Example: [{"word": "wor", "definition": "word", "context": "i nee a wor"}, {"word": "nee hell", "definition": "need help", "context": "i nee hell"}]
-Return ONLY the raw JSON array, with no other text.`;
+Return ONLY the raw JSON array, with no other text, markdown, or explanation.`;
 
      let success = false;
      try {
@@ -273,13 +273,17 @@ Return ONLY the raw JSON array, with no other text.`;
            const jsonMatch = cleanText.match(/\[[\s\S]*\]/);
            if (jsonMatch) cleanText = jsonMatch[0];
            parsed = JSON.parse(cleanText);
-           success = true; // Mark as successful even if empty array
          } catch(err) {
            console.log(`JSON parse error on LLM response. Skipping.`);
          }
          
          if (!Array.isArray(parsed)) parsed = [];
          
+         if (parsed.length > 0) {
+           success = true;
+           console.log(`    [+] Parsed ${parsed.length} entries`);
+         }
+
          for(const ent of parsed) {
             // deduplicate checking by word
             if (ent.word && ent.definition && !dictionaryData.find(d => d.word.toLowerCase() === ent.word.toLowerCase())) {
@@ -309,7 +313,7 @@ Return ONLY the raw JSON array, with no other text.`;
   
   builderState.isBuilding = false;
   builderState.currentItem = '';
-  console.log(`\n[✅ DICTIONARY BUILDER COMPLETE]`);
+  console.log(`\n[✅ DICTIONARY BUILDER COMPLETE] Fetched/Updated entries: ${dictionaryData.length}`);
 });
 
 app.get('/api/training_data', (req, res) => {
@@ -567,15 +571,24 @@ app.post('/api/train-models', async (req, res) => {
        let audioFile = t.audioPath;
        if (audioFile && !fs.existsSync(audioFile)) {
           // If absolute path moved, fallback to uploads dir
-          const fallbackPath = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', path.basename(audioFile));
+          const fallbackPath = path.join(process.cwd(), 'uploads', path.basename(audioFile));
           if (fs.existsSync(fallbackPath)) {
              audioFile = fallbackPath;
+          } else if (!isStorageDisabled) {
+             const fallbackTmp = path.join(os.tmpdir(), path.basename(audioFile));
+             if (fs.existsSync(fallbackTmp)) audioFile = fallbackTmp;
+             else audioFile = null;
           } else {
              audioFile = null;
           }
        }
        if (!audioFile && t.filename) {
-          audioFile = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', t.filename);
+          const uPath = path.join(process.cwd(), 'uploads', t.filename);
+          if (fs.existsSync(uPath)) audioFile = uPath;
+          else {
+             const tPath = path.join(os.tmpdir(), t.filename);
+             if (fs.existsSync(tPath)) audioFile = tPath;
+          }
        }
        
        if (t.hasAudio && audioFile && fs.existsSync(audioFile)) {

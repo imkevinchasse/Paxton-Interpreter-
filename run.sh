@@ -52,10 +52,17 @@ if ! curl -s -f http://localhost:11434/api/tags >/dev/null 2>&1; then
   # Start Ollama binding to all network interfaces
   OLLAMA_HOST=0.0.0.0 ollama serve > ollama.log 2>&1 &
   OLLAMA_PID=$!
-  echo -n "Waiting for Ollama to spin up..."
+  printf "Waiting for Ollama to spin up..."
+  OLLAMA_WAIT=0
   while ! curl -s -f http://localhost:11434/api/tags >/dev/null 2>&1; do
-    sleep 2
-    echo -n "."
+    if [ $OLLAMA_WAIT -ge 20 ]; then
+      echo ""
+      echo "⚠️ Ollama daemon did not report healthy within 20s. Check ollama.log."
+      break
+    fi
+    sleep 1
+    OLLAMA_WAIT=$((OLLAMA_WAIT + 1))
+    printf "."
   done
   echo ""
   echo "✅ Ollama Gateway started locally."
@@ -120,16 +127,28 @@ elif [ "$SERVER_BUILT" = "true" ]; then
   echo "✅ Whisper.cpp directory and server executable found."
 fi
 
-# Ensure model is downloaded even if already built
-if [ ! -f "models/ggml-base.en.bin" ] && [ ! -f "models/ggml-base.bin" ]; then
-  echo "Downloading missing base.en model..."
+# Ensure model exists and is not corrupted/truncated (<50MB)
+MODEL_FILE="models/ggml-base.en.bin"
+if [ ! -f "$MODEL_FILE" ] && [ -f "models/ggml-base.bin" ]; then
+  MODEL_FILE="models/ggml-base.bin"
+fi
+
+M_SIZE=0
+if [ -f "$MODEL_FILE" ]; then
+  M_SIZE=$(wc -c < "$MODEL_FILE" 2>/dev/null || echo 0)
+fi
+
+if [ ! -f "$MODEL_FILE" ] || [ "$M_SIZE" -lt 50000000 ]; then
+  echo "⚠️ Whisper model is missing or incomplete (${M_SIZE} bytes). Downloading ggml-base.en.bin (~148MB)..."
+  rm -f "$MODEL_FILE"
   bash ./models/download-ggml-model.sh base.en
+  MODEL_FILE="models/ggml-base.en.bin"
 fi
 
 cd ..
 
 echo "=> [6/8] Starting Whisper OS API Gateway..."
-if ! curl -s -f http://localhost:8080/ >/dev/null 2>&1; then
+if ! curl -s -f http://localhost:8080/ >/dev/null 2>&1 && ! curl -s http://localhost:8080/inference >/dev/null 2>&1; then
   echo "Starting Whisper server on port 8080..."
   cd whisper.cpp
   WHISPER_EXEC=""
@@ -146,19 +165,92 @@ if ! curl -s -f http://localhost:8080/ >/dev/null 2>&1; then
   elif [ -f "./whisper-server" ]; then
     WHISPER_EXEC="./whisper-server"
   else
-    echo "❌ Whisper server executable not found!"
+    echo "❌ Whisper server executable not found! Attempting to build..."
+    cmake -B build -DWHISPER_BUILD_SERVER=ON
+    cmake --build build --config Release -j
+    if [ -f "./build/bin/whisper-server" ]; then
+      WHISPER_EXEC="./build/bin/whisper-server"
+    elif [ -f "./build/bin/server" ]; then
+      WHISPER_EXEC="./build/bin/server"
+    fi
+  fi
+
+  if [ -z "$WHISPER_EXEC" ] || [ ! -f "$WHISPER_EXEC" ]; then
+    echo "❌ Whisper server executable could not be found or built."
+    cd ..
     exit 1
   fi
-  $WHISPER_EXEC -m models/ggml-base.en.bin --port 8080 --host 0.0.0.0 > ../whisper.log 2>&1 &
+
+  # Determine if --host flag is supported by the binary
+  HOST_FLAG=""
+  if $WHISPER_EXEC --help 2>&1 | grep -q -- "--host"; then
+    HOST_FLAG="--host 0.0.0.0"
+  fi
+
+  $WHISPER_EXEC -m "$MODEL_FILE" --port 8080 $HOST_FLAG > ../whisper.log 2>&1 &
   WHISPER_PID=$!
   cd ..
-  echo -n "Waiting for Whisper server to spin up..."
-  while ! curl -s http://localhost:8080/ >/dev/null 2>&1; do
-    sleep 2
-    echo -n "."
+
+  printf "Waiting for Whisper server to spin up..."
+  MAX_WAIT=20
+  WAITED=0
+  WHISPER_READY=false
+
+  while [ $WAITED -lt $MAX_WAIT ]; do
+    # Check if Whisper process died
+    if ! kill -0 $WHISPER_PID 2>/dev/null; then
+      echo ""
+      echo "❌ Whisper process exited abruptly (PID: $WHISPER_PID)!"
+      if [ -f "whisper.log" ]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📋 whisper.log output:"
+        tail -n 25 whisper.log
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      fi
+
+      echo "⚙️ Attempting automatic recovery..."
+      cd whisper.cpp
+      # Check if model was corrupted
+      CURR_SIZE=$(wc -c < "$MODEL_FILE" 2>/dev/null || echo 0)
+      if [ "$CURR_SIZE" -lt 50000000 ]; then
+        echo "📥 Re-downloading ggml-base.en.bin..."
+        rm -f "$MODEL_FILE"
+        bash ./models/download-ggml-model.sh base.en
+      fi
+
+      echo "🔨 Rebuilding Whisper server cleanly..."
+      rm -rf build
+      cmake -B build -DWHISPER_BUILD_SERVER=ON
+      cmake --build build --config Release -j
+      
+      if [ -f "./build/bin/whisper-server" ]; then
+        WHISPER_EXEC="./build/bin/whisper-server"
+      elif [ -f "./build/bin/server" ]; then
+        WHISPER_EXEC="./build/bin/server"
+      fi
+
+      echo "🚀 Restarting Whisper server..."
+      $WHISPER_EXEC -m "$MODEL_FILE" --port 8080 > ../whisper.log 2>&1 &
+      WHISPER_PID=$!
+      cd ..
+    fi
+
+    if curl -s -f http://localhost:8080/ >/dev/null 2>&1 || curl -s http://localhost:8080/inference >/dev/null 2>&1; then
+      WHISPER_READY=true
+      break
+    fi
+
+    sleep 1
+    WAITED=$((WAITED + 1))
+    printf "."
   done
   echo ""
-  echo "✅ Whisper Gateway is running."
+  if [ "$WHISPER_READY" = "true" ]; then
+    echo "✅ Whisper Gateway is running."
+  else
+    echo "⚠️ Whisper server did not respond within ${MAX_WAIT}s. The main app will still launch."
+    echo "You can check whisper.log for details."
+  fi
 else
   echo "✅ A server is already running on port 8080. Assuming it's Whisper."
 fi

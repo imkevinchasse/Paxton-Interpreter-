@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { Mic, CheckCircle2, ListPlus, Trash2 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { type TrainingItem } from '../types';
+import { playAudioWithResilience } from '../utils/audioPath';
 
 export function TrainingStudio() {
   const [category, setCategory] = useState('Phrase');
@@ -269,10 +270,9 @@ export function TrainingStudio() {
                        {item.filename && (
                          <button 
                            onClick={() => {
-                             const audio = new Audio(`/api/training_data/audio/${item.filename}`);
-                             audio.play();
+                             playAudioWithResilience(item.filename!);
                            }}
-                           className="text-slate-400 hover:text-indigo-500 transition-colors"
+                           className="text-slate-400 hover:text-indigo-500 transition-colors cursor-pointer"
                            title="Play Original Audio"
                          >
                            <Mic className="w-4 h-4" />

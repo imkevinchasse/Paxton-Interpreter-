@@ -3,7 +3,14 @@ import path from 'path';
 import multer from 'multer';
 import fs from 'fs';
 import os from 'os';
+import util from 'util';
+import { fileURLToPath } from 'url';
+import { exec, spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const execAsync = util.promisify(exec);
 
 const app = express();
 app.use(express.json());
@@ -96,6 +103,93 @@ function saveAudioBank() {
 }
 
 // -----------------------------------------------------
+// Auto-reconciliation of finalized audio & training datasets
+// -----------------------------------------------------
+function reconcileFinalizedAudio() {
+  let modified = false;
+
+  // 1. Ensure all finalized items from audioBank exist in trainingData
+  for (const a of audioBank) {
+    if (a.status === 'finalized') {
+      const existing = trainingData.find(t => 
+        (t.filename && a.filename && t.filename === a.filename) ||
+        (t.id && a.id && t.id === a.id) ||
+        (t.sound && a.sound && t.sound.trim().toLowerCase() === a.sound.trim().toLowerCase() &&
+         t.meaning && a.meaning && t.meaning.trim().toLowerCase() === a.meaning.trim().toLowerCase())
+      );
+
+      if (!existing) {
+        trainingData.unshift({
+          id: a.id || (Date.now().toString() + Math.random().toString(36).substring(2, 6)),
+          timestamp: a.timestamp || new Date().toISOString(),
+          category: 'Phrase',
+          sound: a.sound || '',
+          meaning: a.meaning || '',
+          hasAudio: true,
+          audioPath: a.path || (a.filename ? path.join('uploads', a.filename) : undefined),
+          filename: a.filename
+        });
+        modified = true;
+      } else {
+        if (!existing.filename && a.filename) {
+          existing.filename = a.filename;
+          modified = true;
+        }
+        if (!existing.audioPath && (a.path || a.filename)) {
+          existing.audioPath = a.path || path.join('uploads', a.filename);
+          modified = true;
+        }
+        if (!existing.hasAudio) {
+          existing.hasAudio = true;
+          modified = true;
+        }
+        if (!existing.sound && a.sound) {
+          existing.sound = a.sound;
+          modified = true;
+        }
+        if (!existing.meaning && a.meaning) {
+          existing.meaning = a.meaning;
+          modified = true;
+        }
+      }
+    }
+  }
+
+  // 2. Cross-heal any items in trainingData that have missing filename or audioPath
+  for (const t of trainingData) {
+    if ((!t.filename || !t.audioPath) && (t.sound || t.meaning || t.id)) {
+      const match = audioBank.find(a => 
+        a.filename && (
+          (t.id && a.id && t.id === a.id) ||
+          (a.sound && t.sound && a.sound.trim().toLowerCase() === t.sound.trim().toLowerCase()) ||
+          (a.meaning && t.meaning && a.meaning.trim().toLowerCase() === t.meaning.trim().toLowerCase())
+        )
+      );
+      if (match) {
+        if (!t.filename && match.filename) {
+          t.filename = match.filename;
+          modified = true;
+        }
+        if (!t.audioPath && (match.path || match.filename)) {
+          t.audioPath = match.path || path.join('uploads', match.filename);
+          modified = true;
+        }
+        t.hasAudio = true;
+      }
+    }
+  }
+
+  if (modified) {
+    saveTrainingData();
+    saveAudioBank();
+    console.log(`[🔄 RECONCILED] Finalized audio items synced across Audio Bank and Training Data (${trainingData.length} training items, ${audioBank.filter(a => a.status === 'finalized').length} finalized audio samples).`);
+  }
+}
+
+// Initial reconciliation run on startup
+reconcileFinalizedAudio();
+
+// -----------------------------------------------------
 // API Routes
 // -----------------------------------------------------
 
@@ -117,6 +211,7 @@ app.post('/api/sync-data', (req, res) => {
   if (newTraining) trainingData = newTraining;
   if (newAudio) audioBank = newAudio;
   if (newDict) dictionaryData = newDict;
+  reconcileFinalizedAudio();
   saveDb();
   saveTrainingData();
   saveAudioBank();
@@ -317,17 +412,72 @@ Return ONLY the raw JSON array, with no other text, markdown, or explanation.`;
 });
 
 app.get('/api/training_data', (req, res) => {
+  reconcileFinalizedAudio();
   res.json(trainingData);
 });
 
-app.get('/api/training_data/audio/:filename', (req, res) => {
-  const filePath = path.join(isStorageDisabled ? os.tmpdir() : 'uploads', req.params.filename);
-  if (fs.existsSync(filePath)) {
-    res.sendFile(path.resolve(filePath));
-  } else {
-    res.status(404).json({ error: 'Audio file not found' });
+const sendAudioFile = (req: express.Request, res: express.Response) => {
+  let filename = req.params.filename || '';
+  try {
+    filename = decodeURIComponent(filename);
+  } catch(e) {}
+
+  // Strip leading uploads/ or slashes if passed in
+  filename = filename.replace(/^uploads[\\/]/i, '').replace(/^[\\/]+/, '');
+
+  const candidateDirs = [
+    path.join(process.cwd(), 'uploads'),
+    path.resolve('uploads'),
+    path.join(__dirname, 'uploads'),
+    'uploads',
+    isStorageDisabled ? os.tmpdir() : 'uploads',
+    os.tmpdir()
+  ];
+  
+  for (const dir of candidateDirs) {
+    const filePath = path.join(dir, filename);
+    if (fs.existsSync(filePath)) {
+      if (filename.toLowerCase().endsWith('.wav')) {
+        res.setHeader('Content-Type', 'audio/wav');
+      } else if (filename.toLowerCase().endsWith('.webm')) {
+        res.setHeader('Content-Type', 'audio/webm');
+      }
+      return res.sendFile(path.resolve(filePath));
+    }
   }
-});
+
+  const audioItem = audioBank.find(a => 
+    a.filename === filename || 
+    (a.filename && path.basename(a.filename) === path.basename(filename)) ||
+    (a.path && path.basename(a.path) === path.basename(filename))
+  );
+  if (audioItem && audioItem.path && fs.existsSync(audioItem.path)) {
+    if (audioItem.path.toLowerCase().endsWith('.wav')) {
+      res.setHeader('Content-Type', 'audio/wav');
+    }
+    return res.sendFile(path.resolve(audioItem.path));
+  }
+
+  // Also check trainingData audioPath
+  const trainingItem = trainingData.find(t =>
+    t.filename === filename ||
+    (t.audioPath && path.basename(t.audioPath) === path.basename(filename))
+  );
+  if (trainingItem && trainingItem.audioPath && fs.existsSync(trainingItem.audioPath)) {
+    if (trainingItem.audioPath.toLowerCase().endsWith('.wav')) {
+      res.setHeader('Content-Type', 'audio/wav');
+    }
+    return res.sendFile(path.resolve(trainingItem.audioPath));
+  }
+
+  res.status(404).json({ error: 'Audio file not found' });
+};
+
+// Mount static uploads directory for direct WAV access
+app.use('/uploads', express.static(path.resolve('uploads')));
+app.get('/uploads/:filename', sendAudioFile);
+app.get('/api/training_data/audio/:filename', sendAudioFile);
+app.get('/api/audio_bank/audio/:filename', sendAudioFile);
 
 app.delete('/api/training_data/:id', (req, res) => {
   const id = req.params.id;
@@ -523,18 +673,28 @@ app.post('/api/audio_bank/:id/finalize', (req, res) => {
     audio.meaning = req.body.meaning;
     saveAudioBank();
     
-    // Also add to training data
+    // Also add/update in training data
+    const existingIndex = trainingData.findIndex(t => 
+      (t.filename && audio.filename && t.filename === audio.filename) || 
+      (t.id && audio.id && t.id === audio.id)
+    );
+
     const trainingItem = {
-      id: Date.now().toString(),
+      id: audio.id || Date.now().toString(),
       timestamp: new Date().toISOString(),
       category: 'Phrase',
       sound: audio.sound,
       meaning: audio.meaning,
       hasAudio: true,
-      audioPath: audio.path,
+      audioPath: audio.path || (audio.filename ? path.join('uploads', audio.filename) : undefined),
       filename: audio.filename
     };
-    trainingData.unshift(trainingItem);
+
+    if (existingIndex >= 0) {
+      trainingData[existingIndex] = { ...trainingData[existingIndex], ...trainingItem };
+    } else {
+      trainingData.unshift(trainingItem);
+    }
     saveTrainingData();
     
     console.log(`\n[✅ AUDIO FINALIZED & ADDED TO TRAINING] ` + audio.filename);
@@ -548,7 +708,10 @@ app.post('/api/train-models', async (req, res) => {
   console.log(`\n[🚀 WHISPER TRAINING & DATASET BUILD INITIATED]`);
   
   try {
-    // Write out optimized definitions to a JSON file explicitly so LLM memory can load it faster
+    // 1. Reconcile both audioBank and trainingData first
+    reconcileFinalizedAudio();
+
+    // 2. Write out optimized definitions to a JSON file explicitly so LLM memory can load it faster
     const mappedContexts = trainingData.map(t => ({
       input_phonetic: t.sound,
       target_intent: t.meaning,
@@ -561,50 +724,122 @@ app.post('/api/train-models', async (req, res) => {
 
     const datasetDir = path.join(process.cwd(), 'dataset');
     if (!fs.existsSync(datasetDir)) {
-       fs.mkdirSync(datasetDir);
+       fs.mkdirSync(datasetDir, { recursive: true });
     }
     
     const csvContent = ["file_name,transcription,phonetic,intent"];
     let sampleCount = 0;
-    
+
+    // Scan all upload directories to locate files
+    const uploadDirs = [
+      path.join(process.cwd(), 'uploads'),
+      path.resolve('uploads'),
+      path.join(__dirname, 'uploads'),
+      'uploads',
+      isStorageDisabled ? os.tmpdir() : 'uploads',
+      os.tmpdir()
+    ];
+
+    let availableUploadFiles: { name: string; fullPath: string }[] = [];
+    for (const dir of uploadDirs) {
+      if (fs.existsSync(dir)) {
+        try {
+          const files = fs.readdirSync(dir);
+          for (const f of files) {
+            availableUploadFiles.push({ name: f, fullPath: path.join(dir, f) });
+          }
+        } catch(e) {}
+      }
+    }
+
     for (const t of trainingData) {
-       let audioFile = t.audioPath;
-       if (audioFile && !fs.existsSync(audioFile)) {
-          // If absolute path moved, fallback to uploads dir
-          const fallbackPath = path.join(process.cwd(), 'uploads', path.basename(audioFile));
-          if (fs.existsSync(fallbackPath)) {
-             audioFile = fallbackPath;
-          } else if (!isStorageDisabled) {
-             const fallbackTmp = path.join(os.tmpdir(), path.basename(audioFile));
-             if (fs.existsSync(fallbackTmp)) audioFile = fallbackTmp;
-             else audioFile = null;
-          } else {
-             audioFile = null;
-          }
+       // Determine candidate filename
+       let candidateFilename = t.filename;
+       if (!candidateFilename && t.audioPath) {
+         candidateFilename = path.basename(t.audioPath);
        }
-       if (!audioFile && t.filename) {
-          const uPath = path.join(process.cwd(), 'uploads', t.filename);
-          if (fs.existsSync(uPath)) audioFile = uPath;
-          else {
-             const tPath = path.join(os.tmpdir(), t.filename);
-             if (fs.existsSync(tPath)) audioFile = tPath;
-          }
+       if (!candidateFilename && t.path) {
+         candidateFilename = path.basename(t.path);
        }
-       
-       if (t.hasAudio && audioFile && fs.existsSync(audioFile)) {
-          const ext = path.extname(audioFile);
-          const newName = `audio_${t.id}${ext}`;
+       if (!candidateFilename) {
+         const ab = audioBank.find(a => 
+           (a.id === t.id) ||
+           (a.sound && t.sound && a.sound.trim().toLowerCase() === t.sound.trim().toLowerCase()) ||
+           (a.meaning && t.meaning && a.meaning.trim().toLowerCase() === t.meaning.trim().toLowerCase())
+         );
+         if (ab && ab.filename) {
+           candidateFilename = ab.filename;
+           t.filename = ab.filename;
+           if (ab.path) t.audioPath = ab.path;
+         }
+       }
+
+       let audioFile: string | null = null;
+
+       // 1. Direct path check
+       if (t.audioPath && fs.existsSync(t.audioPath)) {
+         audioFile = t.audioPath;
+       } else if (t.path && fs.existsSync(t.path)) {
+         audioFile = t.path;
+       }
+
+       // 2. Candidate filename in candidate directories
+       if (!audioFile && candidateFilename) {
+         for (const dir of uploadDirs) {
+           const p = path.join(dir, candidateFilename);
+           if (fs.existsSync(p)) {
+             audioFile = p;
+             break;
+           }
+         }
+       }
+
+       // 3. Fallback: match basename if audioPath was an absolute path that moved
+       if (!audioFile && (t.audioPath || t.path)) {
+         const base = path.basename(t.audioPath || t.path);
+         for (const dir of uploadDirs) {
+           const p = path.join(dir, base);
+           if (fs.existsSync(p)) {
+             audioFile = p;
+             break;
+           }
+         }
+       }
+
+       // 4. Match against directory contents (case-insensitive or substring)
+       if (!audioFile && candidateFilename) {
+         const match = availableUploadFiles.find(af => 
+           af.name.toLowerCase() === candidateFilename!.toLowerCase() ||
+           af.name.toLowerCase().includes(candidateFilename!.toLowerCase()) ||
+           candidateFilename!.toLowerCase().includes(af.name.toLowerCase())
+         );
+         if (match && fs.existsSync(match.fullPath)) {
+           audioFile = match.fullPath;
+         }
+       }
+
+       // 5. Try matching by item id or timestamp
+       if (!audioFile && t.id) {
+         const match = availableUploadFiles.find(af => af.name.includes(t.id));
+         if (match && fs.existsSync(match.fullPath)) {
+           audioFile = match.fullPath;
+         }
+       }
+
+       if (audioFile && fs.existsSync(audioFile)) {
+          const ext = path.extname(audioFile) || '.wav';
+          const newName = `audio_${t.id || sampleCount}${ext}`;
           const destPath = path.join(datasetDir, newName);
           fs.copyFileSync(audioFile, destPath);
           
           const escapedPhonetic = (t.sound || "").replace(/"/g, '""');
           const escapedTranscription = (t.meaning || "").replace(/"/g, '""');
-          const escapedIntent = (t.category || "").replace(/"/g, '""');
+          const escapedIntent = (t.category || "Phrase").replace(/"/g, '""');
           
           csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
           sampleCount++;
-       } else if (t.hasAudio) {
-          console.log(`[⚠️] Could not locate file: ${t.audioPath || t.filename} (resolved to: ${audioFile})`);
+       } else if (t.hasAudio || candidateFilename) {
+          console.log(`[⚠️] Could not locate file: ${candidateFilename || t.audioPath || t.filename || 'unknown'} for item "${t.sound || t.meaning}" (resolved to: ${audioFile})`);
        }
     }
     
@@ -708,10 +943,6 @@ app.post('/api/interactions', (req, res) => {
 // -----------------------------------------------------
 // Core Local Architecture (Modular Core)
 // -----------------------------------------------------
-
-import { exec, spawn } from 'child_process';
-import util from 'util';
-const execAsync = util.promisify(exec);
 
 class AudioPipeline {
   static async process(file: any) {

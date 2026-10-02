@@ -312,6 +312,17 @@ def main():
     # M2 supports bfloat16 natively via MPS; this is more stable than fp16 on MPS
     use_bf16 = (not use_fp16) and device.type == "mps"
 
+    extra_eval_args = {}
+    try:
+        import inspect
+        sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+        if "eval_strategy" in sig.parameters:
+            extra_eval_args["eval_strategy"] = "epoch"
+        else:
+            extra_eval_args["evaluation_strategy"] = "epoch"
+    except Exception:
+        extra_eval_args["evaluation_strategy"] = "epoch"
+
     training_args = Seq2SeqTrainingArguments(
         output_dir                  = OUTPUT_CHECKPOINTS,
         per_device_train_batch_size = batch_size,
@@ -323,7 +334,6 @@ def main():
         gradient_checkpointing      = True,
         fp16                        = use_fp16,
         bf16                        = use_bf16,
-        evaluation_strategy         = "epoch",
         save_strategy               = "epoch",
         per_device_eval_batch_size  = batch_size,
         predict_with_generate       = True,
@@ -333,6 +343,8 @@ def main():
         load_best_model_at_end      = True,
         metric_for_best_model       = "wer",
         greater_is_better           = False,
+        **extra_eval_args
+    )
         push_to_hub                 = False,
         dataloader_pin_memory       = False,      # MPS requirement
         optim                       = "adamw_torch",

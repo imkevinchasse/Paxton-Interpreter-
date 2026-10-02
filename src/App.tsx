@@ -13,7 +13,28 @@ export default function App() {
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<PipelineResult | null>(null);
-  const [currentView, setCurrentView] = useState<ViewState>('interpreter');
+
+  // Persist current view across page reloads/watches
+  const [currentView, setCurrentView] = useState<ViewState>(() => {
+    try {
+      const hash = window.location.hash.replace('#', '') as ViewState;
+      const validViews: ViewState[] = ['interpreter', 'training_studio', 'training', 'audiobank', 'dictionary', 'settings'];
+      if (hash && validViews.includes(hash)) return hash;
+
+      const saved = localStorage.getItem('paxton_current_view') as ViewState | null;
+      if (saved && validViews.includes(saved)) return saved;
+    } catch (e) {}
+    return 'interpreter';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('paxton_current_view', currentView);
+      if (window.location.hash !== `#${currentView}`) {
+        window.location.hash = currentView;
+      }
+    } catch(e) {}
+  }, [currentView]);
 
   useEffect(() => {
     fetch('/api/interactions')

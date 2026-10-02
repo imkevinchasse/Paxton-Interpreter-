@@ -1,23 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
 #  train.sh  —  Paxton Whisper fine-tuner launcher
-#  Usage:  ./train.sh [epochs] [lr] [batch_size] [transcript_mode]
-#  Example: ./train.sh 5 5e-6 8 phonetic
+#  Usage:  ./run_training.sh [epochs] [lr] [batch_size] [transcript_mode]
+#  Example: ./run_training.sh 5 5e-6 8 phonetic
 # =============================================================================
 set -euo pipefail
-
-# ── Pinned dependency versions ────────────────────────────────────────────────
-# Bump deliberately after testing — never automatically.
-TORCH_VERSION="2.3.1"
-TRANSFORMERS_VERSION="4.41.2"
-DATASETS_VERSION="2.20.0"
-ACCELERATE_VERSION="0.31.0"
-EVALUATE_VERSION="0.4.2"
-SOUNDFILE_VERSION="0.12.1"
-LIBROSA_VERSION="0.10.2"
-TORCHAUDIO_VERSION="2.3.1"
-PANDAS_VERSION="2.2.2"
-JIW_VERSION="0.3.0"       # jiwer — WER metric backend
 
 PYTHON_SCRIPT="train_whisper.py"
 VENV_DIR="venv_train"
@@ -51,8 +38,6 @@ echo "  epochs=$EPOCHS  lr=$LR  batch=$BATCH  mode=$MODE"
 echo ""
 
 # ── Git commit (if in a repo) ─────────────────────────────────────────────────
-# Records exactly which version of the code produced this model.
-# Once you start comparing runs it's invaluable: code + data + params → result.
 if git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
     GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
     GIT_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
@@ -68,22 +53,58 @@ echo ""
 
 # ── Python check ──────────────────────────────────────────────────────────────
 echo "[1/6] Checking Python …"
-if ! command -v python3 &>/dev/null; then
-    echo "❌  python3 not found."
-    echo "    Fix: brew install python@3.11"
+
+PYTHON_BIN=""
+
+# Candidate paths: prioritize standard macOS Homebrew & pyenv Python 3.11 / 3.12 versions
+# which have fully pre-built official Apple Silicon MPS PyTorch wheels.
+CANDIDATES=(
+    "/opt/homebrew/bin/python3.12"
+    "/opt/homebrew/bin/python3.11"
+    "/opt/homebrew/bin/python3.10"
+    "/opt/homebrew/opt/python@3.12/bin/python3"
+    "/opt/homebrew/opt/python@3.11/bin/python3"
+    "/opt/homebrew/opt/python@3.10/bin/python3"
+    "/usr/local/bin/python3.12"
+    "/usr/local/bin/python3.11"
+    "/usr/local/bin/python3.10"
+    "${HOME}/.pyenv/shims/python3.12"
+    "${HOME}/.pyenv/shims/python3.11"
+    "python3.12"
+    "python3.11"
+    "python3.10"
+    "python3"
+)
+
+for cand in "${CANDIDATES[@]}"; do
+    if command -v "$cand" &>/dev/null || [[ -x "$cand" ]]; then
+        CAND_VER=$("$cand" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || true)
+        C_MAJ=$(echo "$CAND_VER" | cut -d. -f1)
+        C_MIN=$(echo "$CAND_VER" | cut -d. -f2)
+        if [[ "$C_MAJ" -eq 3 && "$C_MIN" -ge 10 ]]; then
+            # If 3.10 - 3.12, prefer it immediately as it has official stable PyTorch prebuilt wheels
+            if [[ "$C_MIN" -le 12 ]]; then
+                PYTHON_BIN="$cand"
+                break
+            elif [[ -z "$PYTHON_BIN" ]]; then
+                PYTHON_BIN="$cand"
+            fi
+        fi
+    fi
+done
+
+if [[ -z "$PYTHON_BIN" ]]; then
+    echo "❌  Python 3.10+ required."
+    echo "    Fix on macOS: brew install python@3.11"
     exit 1
 fi
 
-PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
-PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+PY_VERSION=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "   ✅  Using: $PYTHON_BIN (Python $PY_VERSION)"
 
-if [[ "$PY_MAJOR" -lt 3 || ( "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ) ]]; then
-    echo "❌  Python 3.10+ required (found $PY_VERSION)."
-    echo "    Fix: brew install python@3.11"
-    exit 1
+if [[ $(echo "$PY_VERSION" | cut -d. -f2) -gt 12 ]]; then
+    echo "   ℹ️   Python $PY_VERSION detected. Note: Apple Silicon PyTorch wheels are officially tested on 3.10-3.12."
 fi
-echo "   ✅  Python $PY_VERSION"
 
 # ── Platform check ────────────────────────────────────────────────────────────
 echo "[2/6] Checking platform …"
@@ -101,9 +122,18 @@ fi
 # ── Virtual environment ───────────────────────────────────────────────────────
 echo "[3/6] Setting up virtual environment …"
 
+VENV_PY="$VENV_DIR/bin/python3"
+if [[ -d "$VENV_DIR" && -x "$VENV_PY" ]]; then
+    CURRENT_VENV_VER=$("$VENV_PY" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "corrupt")
+    if [[ "$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt" ]]; then
+        echo "   Recreating $VENV_DIR for $PYTHON_BIN (Python $PY_VERSION) …"
+        rm -rf "$VENV_DIR"
+    fi
+fi
+
 if [[ ! -d "$VENV_DIR" ]]; then
     echo "   Creating $VENV_DIR …"
-    python3 -m venv "$VENV_DIR"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
 else
     echo "   Found existing $VENV_DIR"
 fi
@@ -114,30 +144,46 @@ echo "   ✅  Activated: $(which python3)"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "[4/6] Installing / verifying dependencies …"
-echo "   (pip output goes to log only)"
 
-pip install --upgrade pip --quiet
+if python3 -c "import torch, torchaudio, transformers, datasets, accelerate, evaluate, soundfile, librosa, pandas, jiwer" &>/dev/null; then
+    TORCH_INSTALLED=$(python3 -c "import torch; print(torch.__version__)")
+    echo "   ✅  Dependencies already installed and functional (PyTorch $TORCH_INSTALLED)"
+else
+    echo "   Installing compatible wheels for Python $PY_VERSION …"
+    pip install --upgrade pip setuptools wheel --quiet || true
 
-# PyTorch on Apple Silicon:
-# The standard PyPI wheel already includes MPS support since PyTorch 2.x.
-# The --index-url cpu wheel was intended for Linux CI; using it on M-series
-# Macs can actually install a CPU-only build and disable MPS.
-# We install from PyPI directly here regardless of platform.
-pip install --quiet \
-    "torch==${TORCH_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}"
+    # Flexible PyTorch & Torchaudio installation (no rigid legacy ==2.3.1 pin)
+    echo "   Installing PyTorch & Torchaudio …"
+    if ! pip install --quiet torch torchaudio; then
+        echo "   Retrying with flexible version bounds …"
+        if ! pip install --quiet "torch>=2.2.0" "torchaudio>=2.2.0"; then
+            echo "   Retrying with pre-release channel …"
+            if ! pip install --quiet --pre torch torchaudio; then
+                echo ""
+                echo "❌  Could not find or install a compatible PyTorch wheel for Python $PY_VERSION."
+                echo "    Apple Silicon PyTorch wheels are officially prebuilt for Python 3.10, 3.11, and 3.12."
+                echo "    Recommended fix in your Mac Terminal:"
+                echo "      brew install python@3.11"
+                echo "      rm -rf venv_train"
+                echo "    Then re-launch training."
+                exit 1
+            fi
+        fi
+    fi
 
-pip install --quiet \
-    "transformers==${TRANSFORMERS_VERSION}" \
-    "datasets==${DATASETS_VERSION}" \
-    "accelerate==${ACCELERATE_VERSION}" \
-    "evaluate==${EVALUATE_VERSION}" \
-    "soundfile==${SOUNDFILE_VERSION}" \
-    "librosa==${LIBROSA_VERSION}" \
-    "pandas==${PANDAS_VERSION}" \
-    "jiwer==${JIW_VERSION}"
+    echo "   Installing Hugging Face & Audio libraries …"
+    pip install --quiet \
+        "transformers>=4.40.0" \
+        "datasets>=2.19.0" \
+        "accelerate>=0.30.0" \
+        "evaluate>=0.4.0" \
+        "soundfile>=0.12.0" \
+        "librosa>=0.10.0" \
+        "pandas>=2.0.0" \
+        "jiwer>=0.3.0"
 
-echo "   ✅  Dependencies ready"
+    echo "   ✅  Dependencies ready"
+fi
 
 # ── MPS runtime check ─────────────────────────────────────────────────────────
 if [[ "$IS_APPLE_SILICON" == true ]]; then

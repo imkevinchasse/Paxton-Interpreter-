@@ -14,7 +14,9 @@ import {
   Sliders, 
   Volume2, 
   ChevronRight,
-  Info
+  Info,
+  AlertCircle,
+  X
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { type TrainingTelemetry, type TrainingMetricPoint } from '../types';
@@ -31,6 +33,7 @@ export function TrainingStudioView() {
   const [checkpoints, setCheckpoints] = useState<any[]>([]);
   const [datasetItems, setDatasetItems] = useState<any[]>([]);
   const [starting, setStarting] = useState<boolean>(false);
+  const [studioError, setStudioError] = useState<string | null>(null);
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
@@ -82,6 +85,8 @@ export function TrainingStudioView() {
 
   const handleStartRealTraining = async () => {
     setStarting(true);
+    setStudioError(null);
+    setActiveTab('console'); // Stream logs immediately
     try {
       const res = await fetch('/api/training/start', {
         method: 'POST',
@@ -90,12 +95,12 @@ export function TrainingStudioView() {
       });
       const data = await res.json();
       if (!res.ok) {
-        alert(data.message || data.error || 'Failed to start training');
+        setStudioError(data.message || data.error || 'Failed to start training');
       }
       await fetchStatus();
-    } catch(e) {
+    } catch(e: any) {
       console.error(e);
-      alert('Network error launching training pipeline');
+      setStudioError(e?.message || 'Network error launching training pipeline');
     } finally {
       setStarting(false);
     }
@@ -177,6 +182,7 @@ export function TrainingStudioView() {
           {!isRunning ? (
             <>
               <button
+                type="button"
                 onClick={handleStartRealTraining}
                 disabled={starting}
                 className="flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white font-bold rounded-xl transition-all shadow-sm text-xs cursor-pointer"
@@ -186,6 +192,7 @@ export function TrainingStudioView() {
               </button>
               
               <button
+                type="button"
                 onClick={handleStartSimulation}
                 className="flex items-center gap-1.5 px-4 py-2.5 bg-white border border-slate-200 text-slate-700 hover:border-indigo-300 hover:text-indigo-600 font-bold rounded-xl transition-all shadow-xs text-xs cursor-pointer"
                 title="Simulates realistic telemetry and curves for immediate testing"
@@ -196,6 +203,7 @@ export function TrainingStudioView() {
             </>
           ) : (
             <button
+              type="button"
               onClick={handleStopTraining}
               className="flex items-center gap-2 px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl transition-all shadow-sm text-xs cursor-pointer"
             >
@@ -205,6 +213,7 @@ export function TrainingStudioView() {
           )}
 
           <button
+            type="button"
             onClick={fetchStatus}
             className="p-2.5 bg-white border border-slate-200 text-slate-500 hover:text-slate-800 rounded-xl transition-colors shadow-xs cursor-pointer"
             title="Refresh Telemetry"
@@ -213,6 +222,23 @@ export function TrainingStudioView() {
           </button>
         </div>
       </div>
+
+      {/* Error Alert Banner */}
+      {studioError && (
+        <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl flex items-center justify-between text-xs text-rose-800 shadow-xs">
+          <div className="flex items-center gap-2.5">
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
+            <span className="font-medium">{studioError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setStudioError(null)}
+            className="text-rose-500 hover:text-rose-700 p-1 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Telemetry Summary Strip */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -325,6 +351,7 @@ export function TrainingStudioView() {
         {/* Interactive Segmented Tab Controls */}
         <div className="flex border-b border-slate-200 bg-slate-50 p-1.5 gap-1">
           <button
+            type="button"
             onClick={() => setActiveTab('console')}
             className={`flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
               activeTab === 'console'
@@ -338,6 +365,7 @@ export function TrainingStudioView() {
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('metrics')}
             className={`flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
               activeTab === 'metrics'
@@ -351,6 +379,7 @@ export function TrainingStudioView() {
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('dataset')}
             className={`flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
               activeTab === 'dataset'
@@ -364,6 +393,7 @@ export function TrainingStudioView() {
           </button>
 
           <button
+            type="button"
             onClick={() => setActiveTab('checkpoints')}
             className={`flex items-center gap-2 px-4 py-2 text-xs font-bold rounded-lg transition-colors cursor-pointer ${
               activeTab === 'checkpoints'
@@ -401,6 +431,7 @@ export function TrainingStudioView() {
 
               <div className="flex items-center gap-2">
                 <button
+                  type="button"
                   onClick={handleCopyLogs}
                   className="flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] transition-colors cursor-pointer"
                 >
@@ -412,6 +443,32 @@ export function TrainingStudioView() {
 
             {/* Console Window */}
             <div className="h-[460px] overflow-y-auto p-4 font-mono text-xs leading-relaxed space-y-1 select-text">
+              {telemetry?.status === 'failed' && (
+                <div className="mb-4 p-4 bg-amber-950/70 border border-amber-600/50 rounded-xl font-sans text-xs text-amber-200 space-y-2">
+                  <div className="font-bold flex items-center gap-2 text-amber-300">
+                    <Info className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>Apple Silicon Mac: PyTorch &amp; Python Compatibility</span>
+                  </div>
+                  <p className="text-amber-200/90 leading-relaxed font-sans">
+                    If your local Mac training failed during dependency setup (e.g. <code>torch==2.3.1</code> not found on Python 3.14), Apple Silicon prebuilt MPS GPU wheels are officially targeted at <strong>Python 3.11 and 3.12</strong>.
+                  </p>
+                  <div className="bg-black/50 p-2.5 rounded-lg border border-amber-500/30 flex items-center justify-between font-mono text-[11px] text-amber-300">
+                    <span>brew install python@3.11 &amp;&amp; rm -rf venv_train</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        navigator.clipboard.writeText('brew install python@3.11 && rm -rf venv_train');
+                        setCopiedLogs(true);
+                        setTimeout(() => setCopiedLogs(false), 2000);
+                      }}
+                      className="ml-3 px-2 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded font-sans font-bold text-[10px] cursor-pointer"
+                    >
+                      Copy Command
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {(!telemetry?.logs || telemetry.logs.length === 0) ? (
                 <div className="text-slate-500 py-12 text-center">
                   No active training output. Click &ldquo;Start Fine-Tuning&rdquo; or &ldquo;Live Simulation Demo&rdquo; to begin streaming.

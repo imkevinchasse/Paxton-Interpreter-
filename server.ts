@@ -424,6 +424,7 @@ const sendAudioFile = (req: express.Request, res: express.Response) => {
 
   // Strip leading uploads/ or slashes if passed in
   filename = filename.replace(/^uploads[\\/]/i, '').replace(/^[\\/]+/, '');
+  const cleanRequested = filename.replace(/^\d{10,14}[-_]/, '').toLowerCase();
 
   const candidateDirs = [
     path.join(process.cwd(), 'uploads'),
@@ -434,6 +435,7 @@ const sendAudioFile = (req: express.Request, res: express.Response) => {
     os.tmpdir()
   ];
   
+  // 1. Direct path check in candidate directories
   for (const dir of candidateDirs) {
     const filePath = path.join(dir, filename);
     if (fs.existsSync(filePath)) {
@@ -446,10 +448,41 @@ const sendAudioFile = (req: express.Request, res: express.Response) => {
     }
   }
 
+  // 2. Directory scan for timestamp-prefixed, suffix, or case-insensitive matches
+  for (const dir of candidateDirs) {
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+      try {
+        const files = fs.readdirSync(dir);
+        const match = files.find(f => {
+          const fLower = f.toLowerCase();
+          const fClean = fLower.replace(/^\d{10,14}[-_]/, '');
+          return (
+            fLower === filename.toLowerCase() ||
+            fClean === cleanRequested ||
+            fLower.endsWith('-' + filename.toLowerCase()) ||
+            fLower.endsWith('_' + filename.toLowerCase()) ||
+            fClean.replace(/\.[^/.]+$/, '') === cleanRequested.replace(/\.[^/.]+$/, '')
+          );
+        });
+        if (match) {
+          const matchPath = path.join(dir, match);
+          if (match.toLowerCase().endsWith('.wav')) {
+            res.setHeader('Content-Type', 'audio/wav');
+          } else if (match.toLowerCase().endsWith('.webm')) {
+            res.setHeader('Content-Type', 'audio/webm');
+          }
+          return res.sendFile(path.resolve(matchPath));
+        }
+      } catch (e) {}
+    }
+  }
+
+  // 3. AudioBank stored item check
   const audioItem = audioBank.find(a => 
     a.filename === filename || 
     (a.filename && path.basename(a.filename) === path.basename(filename)) ||
-    (a.path && path.basename(a.path) === path.basename(filename))
+    (a.path && path.basename(a.path) === path.basename(filename)) ||
+    (a.filename && a.filename.replace(/^\d{10,14}[-_]/, '').toLowerCase() === cleanRequested)
   );
   if (audioItem && audioItem.path && fs.existsSync(audioItem.path)) {
     if (audioItem.path.toLowerCase().endsWith('.wav')) {
@@ -458,10 +491,11 @@ const sendAudioFile = (req: express.Request, res: express.Response) => {
     return res.sendFile(path.resolve(audioItem.path));
   }
 
-  // Also check trainingData audioPath
+  // 4. TrainingData stored item check
   const trainingItem = trainingData.find(t =>
     t.filename === filename ||
-    (t.audioPath && path.basename(t.audioPath) === path.basename(filename))
+    (t.audioPath && path.basename(t.audioPath) === path.basename(filename)) ||
+    (t.filename && t.filename.replace(/^\d{10,14}[-_]/, '').toLowerCase() === cleanRequested)
   );
   if (trainingItem && trainingItem.audioPath && fs.existsSync(trainingItem.audioPath)) {
     if (trainingItem.audioPath.toLowerCase().endsWith('.wav')) {
@@ -704,173 +738,642 @@ app.post('/api/audio_bank/:id/finalize', (req, res) => {
   res.json(audio);
 });
 
-app.post('/api/train-models', async (req, res) => {
-  console.log(`\n[🚀 WHISPER TRAINING & DATASET BUILD INITIATED]`);
-  
+// -----------------------------------------------------
+// Fine-Tuning & Training Telemetry State
+// -----------------------------------------------------
+let activeTrainProcess: any = null;
+let simulationInterval: any = null;
+
+interface MetricPoint {
+  epoch: number;
+  step: number;
+  trainLoss?: number;
+  evalLoss?: number;
+  evalWer?: number;
+  learningRate?: number;
+  timestamp: string;
+}
+
+let trainingTelemetry: {
+  status: 'idle' | 'preparing' | 'training' | 'completed' | 'failed';
+  phase: string;
+  currentEpoch: number;
+  totalEpochs: number;
+  currentStep: number;
+  totalSteps: number;
+  trainLoss: number | null;
+  evalLoss: number | null;
+  evalWer: number | null;
+  bestWer: number | null;
+  history: MetricPoint[];
+  sampleCount: number;
+  device: string;
+  modelName: string;
+  transcriptMode: string;
+  startTime: number | null;
+  endTime: number | null;
+  elapsedSeconds: number;
+  estimatedRemainingSeconds: number | null;
+  logs: string[];
+  totalLogLines: number;
+  error?: string | null;
+  isSimulated?: boolean;
+} = {
+  status: 'idle',
+  phase: 'Ready for training',
+  currentEpoch: 0,
+  totalEpochs: 15,
+  currentStep: 0,
+  totalSteps: 100,
+  trainLoss: null,
+  evalLoss: null,
+  evalWer: null,
+  bestWer: null,
+  history: [],
+  sampleCount: 0,
+  device: 'Detecting...',
+  modelName: 'openai/whisper-small.en',
+  transcriptMode: 'phonetic',
+  startTime: null,
+  endTime: null,
+  elapsedSeconds: 0,
+  estimatedRemainingSeconds: null,
+  logs: [],
+  totalLogLines: 0,
+  error: null,
+  isSimulated: false
+};
+
+function pushTrainingLog(rawLine: string) {
+  if (!rawLine) return;
+  const line = String(rawLine).replace(/\r/g, '').trimEnd();
+  if (!line) return;
+
+  trainingTelemetry.logs.push(line);
+  trainingTelemetry.totalLogLines++;
+  if (trainingTelemetry.logs.length > 2500) {
+    trainingTelemetry.logs.shift();
+  }
+
+  // Write to log file asynchronously
   try {
-    // 1. Reconcile both audioBank and trainingData first
-    reconcileFinalizedAudio();
+    if (!fs.existsSync('logs')) fs.mkdirSync('logs', { recursive: true });
+    fs.appendFileSync('logs/training_latest.log', line + '\n');
+  } catch(e) {}
 
-    // 2. Write out optimized definitions to a JSON file explicitly so LLM memory can load it faster
-    const mappedContexts = trainingData.map(t => ({
-      input_phonetic: t.sound,
-      target_intent: t.meaning,
-      category: t.category
-    }));
+  // Parse key milestones & telemetry
+  if (/\[1\/6\] Checking Python/i.test(line)) {
+    trainingTelemetry.phase = 'Checking Python Environment';
+  } else if (/\[2\/6\] Checking platform/i.test(line)) {
+    trainingTelemetry.phase = 'Platform & Device Verification';
+  } else if (/Apple Silicon.*MPS/i.test(line)) {
+    trainingTelemetry.device = 'Apple Silicon (MPS GPU)';
+  } else if (/CUDA backend/i.test(line)) {
+    trainingTelemetry.device = 'NVIDIA CUDA GPU';
+  } else if (/CPU backend/i.test(line)) {
+    trainingTelemetry.device = 'CPU';
+  } else if (/\[3\/6\] Setting up virtual environment/i.test(line)) {
+    trainingTelemetry.phase = 'Setting up Virtual Environment (venv_train)';
+  } else if (/\[4\/6\] Installing.*dependencies/i.test(line)) {
+    trainingTelemetry.phase = 'Installing & Verifying PyTorch & Transformers';
+  } else if (/\[5\/6\] Verifying MPS in PyTorch/i.test(line)) {
+    trainingTelemetry.phase = 'Verifying MPS GPU Acceleration';
+  } else if (/\[6\/6\] Checking dataset/i.test(line)) {
+    trainingTelemetry.phase = 'Auditing Dataset & Vocabulary';
+  } else if (/\[1\/5\] Splitting dataset/i.test(line)) {
+    trainingTelemetry.phase = 'Splitting Train / Validation Sets';
+  } else if (/\[2\/5\] Loading processor/i.test(line)) {
+    trainingTelemetry.phase = 'Loading Whisper Processor & Tokenizer';
+  } else if (/\[3\/5\] Preprocessing audio/i.test(line)) {
+    trainingTelemetry.phase = 'Audio Feature Extraction & Augmentation';
+  } else if (/\[4\/5\] Loading model/i.test(line)) {
+    trainingTelemetry.phase = 'Initializing Whisper Neural Weights';
+  } else if (/\[5\/5\] Training/i.test(line)) {
+    trainingTelemetry.phase = 'Fine-Tuning Transformer Layers';
+    trainingTelemetry.status = 'training';
+  }
+
+  // Regex parse Hugging Face Trainer metrics: e.g. {'loss': 0.45, 'learning_rate': 4.5e-6, 'epoch': 1.0}
+  const lossMatch = line.match(/\{.*['"]loss['"]\s*:\s*([0-9.]+).*['"]epoch['"]\s*:\s*([0-9.]+).*\}/);
+  if (lossMatch) {
+    const loss = parseFloat(lossMatch[1]);
+    const epoch = parseFloat(lossMatch[2]);
+    trainingTelemetry.trainLoss = loss;
+    trainingTelemetry.currentEpoch = Math.floor(epoch);
+    trainingTelemetry.phase = `Epoch ${Math.min(trainingTelemetry.totalEpochs, Math.floor(epoch) + 1)}/${trainingTelemetry.totalEpochs} — Train Loss: ${loss.toFixed(4)}`;
     
-    if (!isStorageDisabled) {
-      fs.writeFileSync('optimized_context.json', JSON.stringify(mappedContexts, null, 2));
+    trainingTelemetry.history.push({
+      epoch: Number(epoch.toFixed(2)),
+      step: trainingTelemetry.history.length + 1,
+      trainLoss: loss,
+      timestamp: new Date().toLocaleTimeString()
+    });
+  }
+
+  // Regex parse evaluation metrics: e.g. {'eval_loss': 0.42, 'eval_wer': 0.28, 'epoch': 1.0}
+  const evalMatch = line.match(/\{.*['"]eval_loss['"]\s*:\s*([0-9.]+).*['"]eval_wer['"]\s*:\s*([0-9.]+).*\}/);
+  if (evalMatch) {
+    const eLoss = parseFloat(evalMatch[1]);
+    const wer = parseFloat(evalMatch[2]);
+    trainingTelemetry.evalLoss = eLoss;
+    trainingTelemetry.evalWer = wer;
+    if (trainingTelemetry.bestWer === null || wer < trainingTelemetry.bestWer) {
+      trainingTelemetry.bestWer = wer;
     }
 
-    const datasetDir = path.join(process.cwd(), 'dataset');
-    if (!fs.existsSync(datasetDir)) {
-       fs.mkdirSync(datasetDir, { recursive: true });
+    const last = trainingTelemetry.history[trainingTelemetry.history.length - 1];
+    if (last) {
+      last.evalLoss = eLoss;
+      last.evalWer = wer;
+    } else {
+      trainingTelemetry.history.push({
+        epoch: trainingTelemetry.currentEpoch,
+        step: trainingTelemetry.history.length + 1,
+        evalLoss: eLoss,
+        evalWer: wer,
+        timestamp: new Date().toLocaleTimeString()
+      });
     }
-    
-    const csvContent = ["file_name,transcription,phonetic,intent"];
-    let sampleCount = 0;
+  }
 
-    // Scan all upload directories to locate files
-    const uploadDirs = [
-      path.join(process.cwd(), 'uploads'),
-      path.resolve('uploads'),
-      path.join(__dirname, 'uploads'),
-      'uploads',
-      isStorageDisabled ? os.tmpdir() : 'uploads',
-      os.tmpdir()
-    ];
+  // Completion parsing
+  if (/Training complete/i.test(line) || /Saved →.*whisper-paxton-final/i.test(line)) {
+    trainingTelemetry.status = 'completed';
+    trainingTelemetry.phase = 'Fine-Tuning Complete — Model Weights Saved';
+    trainingTelemetry.endTime = Date.now();
+  }
+}
 
-    let availableUploadFiles: { name: string; fullPath: string }[] = [];
-    for (const dir of uploadDirs) {
-      if (fs.existsSync(dir)) {
-        try {
-          const files = fs.readdirSync(dir);
-          for (const f of files) {
-            availableUploadFiles.push({ name: f, fullPath: path.join(dir, f) });
-          }
-        } catch(e) {}
+// -----------------------------------------------------
+// Dataset builder helper
+// -----------------------------------------------------
+function buildDatasetCsv(): { sampleCount: number; csvPath: string } {
+  reconcileFinalizedAudio();
+
+  const datasetDir = path.join(process.cwd(), 'dataset');
+  if (!fs.existsSync(datasetDir)) {
+    fs.mkdirSync(datasetDir, { recursive: true });
+  }
+
+  const csvContent = ["file_name,transcription,phonetic,intent"];
+  let sampleCount = 0;
+
+  const uploadDirs = [
+    path.join(process.cwd(), 'uploads'),
+    path.resolve('uploads'),
+    path.join(__dirname, 'uploads'),
+    'uploads',
+    isStorageDisabled ? os.tmpdir() : 'uploads',
+    os.tmpdir()
+  ];
+
+  let availableUploadFiles: { name: string; fullPath: string }[] = [];
+  for (const dir of uploadDirs) {
+    if (fs.existsSync(dir)) {
+      try {
+        const files = fs.readdirSync(dir);
+        for (const f of files) {
+          availableUploadFiles.push({ name: f, fullPath: path.join(dir, f) });
+        }
+      } catch(e) {}
+    }
+  }
+
+  for (const t of trainingData) {
+    let candidateFilename = t.filename;
+    if (!candidateFilename && t.audioPath) {
+      candidateFilename = path.basename(t.audioPath);
+    }
+    if (!candidateFilename) {
+      const ab = audioBank.find(a => 
+        (a.id === t.id) ||
+        (a.sound && t.sound && a.sound.trim().toLowerCase() === t.sound.trim().toLowerCase()) ||
+        (a.meaning && t.meaning && a.meaning.trim().toLowerCase() === t.meaning.trim().toLowerCase())
+      );
+      if (ab && ab.filename) {
+        candidateFilename = ab.filename;
+        t.filename = ab.filename;
+        if (ab.path) t.audioPath = ab.path;
       }
     }
 
-    for (const t of trainingData) {
-       // Determine candidate filename
-       let candidateFilename = t.filename;
-       if (!candidateFilename && t.audioPath) {
-         candidateFilename = path.basename(t.audioPath);
-       }
-       if (!candidateFilename && t.path) {
-         candidateFilename = path.basename(t.path);
-       }
-       if (!candidateFilename) {
-         const ab = audioBank.find(a => 
-           (a.id === t.id) ||
-           (a.sound && t.sound && a.sound.trim().toLowerCase() === t.sound.trim().toLowerCase()) ||
-           (a.meaning && t.meaning && a.meaning.trim().toLowerCase() === t.meaning.trim().toLowerCase())
-         );
-         if (ab && ab.filename) {
-           candidateFilename = ab.filename;
-           t.filename = ab.filename;
-           if (ab.path) t.audioPath = ab.path;
-         }
-       }
+    let audioFile: string | null = null;
+    if (t.audioPath && fs.existsSync(t.audioPath)) audioFile = t.audioPath;
+    else if (t.path && fs.existsSync(t.path)) audioFile = t.path;
 
-       let audioFile: string | null = null;
-
-       // 1. Direct path check
-       if (t.audioPath && fs.existsSync(t.audioPath)) {
-         audioFile = t.audioPath;
-       } else if (t.path && fs.existsSync(t.path)) {
-         audioFile = t.path;
-       }
-
-       // 2. Candidate filename in candidate directories
-       if (!audioFile && candidateFilename) {
-         for (const dir of uploadDirs) {
-           const p = path.join(dir, candidateFilename);
-           if (fs.existsSync(p)) {
-             audioFile = p;
-             break;
-           }
-         }
-       }
-
-       // 3. Fallback: match basename if audioPath was an absolute path that moved
-       if (!audioFile && (t.audioPath || t.path)) {
-         const base = path.basename(t.audioPath || t.path);
-         for (const dir of uploadDirs) {
-           const p = path.join(dir, base);
-           if (fs.existsSync(p)) {
-             audioFile = p;
-             break;
-           }
-         }
-       }
-
-       // 4. Match against directory contents (case-insensitive or substring)
-       if (!audioFile && candidateFilename) {
-         const match = availableUploadFiles.find(af => 
-           af.name.toLowerCase() === candidateFilename!.toLowerCase() ||
-           af.name.toLowerCase().includes(candidateFilename!.toLowerCase()) ||
-           candidateFilename!.toLowerCase().includes(af.name.toLowerCase())
-         );
-         if (match && fs.existsSync(match.fullPath)) {
-           audioFile = match.fullPath;
-         }
-       }
-
-       // 5. Try matching by item id or timestamp
-       if (!audioFile && t.id) {
-         const match = availableUploadFiles.find(af => af.name.includes(t.id));
-         if (match && fs.existsSync(match.fullPath)) {
-           audioFile = match.fullPath;
-         }
-       }
-
-       if (audioFile && fs.existsSync(audioFile)) {
-          const ext = path.extname(audioFile) || '.wav';
-          const newName = `audio_${t.id || sampleCount}${ext}`;
-          const destPath = path.join(datasetDir, newName);
-          fs.copyFileSync(audioFile, destPath);
-          
-          const escapedPhonetic = (t.sound || "").replace(/"/g, '""');
-          const escapedTranscription = (t.meaning || "").replace(/"/g, '""');
-          const escapedIntent = (t.category || "Phrase").replace(/"/g, '""');
-          
-          csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
-          sampleCount++;
-       } else if (t.hasAudio || candidateFilename) {
-          console.log(`[⚠️] Could not locate file: ${candidateFilename || t.audioPath || t.filename || 'unknown'} for item "${t.sound || t.meaning}" (resolved to: ${audioFile})`);
-       }
+    if (!audioFile && candidateFilename) {
+      for (const dir of uploadDirs) {
+        const p = path.join(dir, candidateFilename);
+        if (fs.existsSync(p)) { audioFile = p; break; }
+      }
     }
-    
-    fs.writeFileSync(path.join(datasetDir, "metadata.csv"), csvContent.join("\n"));
-    console.log(`[📊] Exported ${sampleCount} real audio samples to dataset/metadata.csv`);
+
+    if (!audioFile && candidateFilename) {
+      const match = availableUploadFiles.find(af => 
+        af.name.toLowerCase() === candidateFilename!.toLowerCase() ||
+        af.name.toLowerCase().includes(candidateFilename!.toLowerCase()) ||
+        candidateFilename!.toLowerCase().includes(af.name.toLowerCase())
+      );
+      if (match && fs.existsSync(match.fullPath)) {
+        audioFile = match.fullPath;
+      }
+    }
+
+    if (audioFile && fs.existsSync(audioFile)) {
+      const ext = path.extname(audioFile) || '.wav';
+      const newName = `audio_${t.id || sampleCount}${ext}`;
+      const destPath = path.join(datasetDir, newName);
+      try {
+        fs.copyFileSync(audioFile, destPath);
+      } catch(e) {}
+
+      const escapedPhonetic = (t.sound || "").replace(/"/g, '""');
+      const escapedTranscription = (t.meaning || "").replace(/"/g, '""');
+      const escapedIntent = (t.category || "Phrase").replace(/"/g, '""');
+      
+      csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
+      sampleCount++;
+    }
+  }
+
+  const csvPath = path.join(datasetDir, "metadata.csv");
+  fs.writeFileSync(csvPath, csvContent.join("\n"));
+  console.log(`[📊] Exported ${sampleCount} real audio samples to dataset/metadata.csv`);
+  return { sampleCount, csvPath };
+}
+
+// -----------------------------------------------------
+// Training APIs
+// -----------------------------------------------------
+
+app.get('/api/training/status', (req, res) => {
+  // Update elapsed seconds if running
+  if (trainingTelemetry.status === 'training' || trainingTelemetry.status === 'preparing') {
+    if (trainingTelemetry.startTime) {
+      trainingTelemetry.elapsedSeconds = Math.floor((Date.now() - trainingTelemetry.startTime) / 1000);
+      if (trainingTelemetry.currentEpoch > 0 && trainingTelemetry.totalEpochs > 0) {
+        const progress = trainingTelemetry.currentEpoch / trainingTelemetry.totalEpochs;
+        const totalEstimate = trainingTelemetry.elapsedSeconds / progress;
+        trainingTelemetry.estimatedRemainingSeconds = Math.max(0, Math.floor(totalEstimate - trainingTelemetry.elapsedSeconds));
+      }
+    }
+  }
+  res.json(trainingTelemetry);
+});
+
+app.get('/api/training/logs', (req, res) => {
+  const since = parseInt(req.query.since as string) || 0;
+  const slice = trainingTelemetry.logs.slice(since);
+  res.json({
+    logs: slice,
+    totalLogLines: trainingTelemetry.totalLogLines,
+    status: trainingTelemetry.status,
+    phase: trainingTelemetry.phase
+  });
+});
+
+app.post('/api/training/stop', (req, res) => {
+  if (simulationInterval) {
+    clearInterval(simulationInterval);
+    simulationInterval = null;
+  }
+  if (activeTrainProcess) {
+    try {
+      activeTrainProcess.kill('SIGTERM');
+    } catch(e) {}
+    activeTrainProcess = null;
+  }
+  trainingTelemetry.status = 'idle';
+  trainingTelemetry.phase = 'Training stopped by user';
+  pushTrainingLog('⚠️ Training session cancelled by user.');
+  res.json({ success: true, message: 'Training session stopped.' });
+});
+
+app.post('/api/training/simulate', (req, res) => {
+  // Stop existing
+  if (simulationInterval) clearInterval(simulationInterval);
+  if (activeTrainProcess) {
+    try { activeTrainProcess.kill(); } catch(e) {}
+    activeTrainProcess = null;
+  }
+
+  const epochs = Number(req.body.epochs) || 5;
+  const lr = req.body.lr || '5e-6';
+  const batchSize = Number(req.body.batchSize) || 8;
+  const mode = req.body.mode || 'phonetic';
+
+  trainingTelemetry = {
+    status: 'preparing',
+    phase: 'Initializing Fine-Tuning Simulation …',
+    currentEpoch: 0,
+    totalEpochs: epochs,
+    currentStep: 0,
+    totalSteps: epochs * 20,
+    trainLoss: 0.95,
+    evalLoss: 0.92,
+    evalWer: 0.52,
+    bestWer: 0.52,
+    history: [],
+    sampleCount: trainingData.length || 176,
+    device: 'Apple Silicon (M2 Pro MPS GPU - Accelerated)',
+    modelName: 'openai/whisper-small.en',
+    transcriptMode: mode,
+    startTime: Date.now(),
+    endTime: null,
+    elapsedSeconds: 0,
+    estimatedRemainingSeconds: 30,
+    logs: [],
+    totalLogLines: 0,
+    error: null,
+    isSimulated: true
+  };
+
+  const simSteps = [
+    { delay: 400, log: "============================================================" },
+    { delay: 800, log: "  Paxton Whisper Fine-Tuner Engine (Local Studio)" },
+    { delay: 1200, log: `  Target Model : openai/whisper-small.en (244M params)` },
+    { delay: 1600, log: `  Hyperparameters: epochs=${epochs}  lr=${lr}  batch=${batchSize}  mode=${mode}` },
+    { delay: 2000, log: "[1/6] Checking Python … ✅ Python 3.10.12 found" },
+    { delay: 2500, log: "[2/6] Checking platform … ✅ Apple Silicon (arm64) — MPS GPU active" },
+    { delay: 3000, log: "[3/6] Setting up virtual environment … ✅ venv_train activated" },
+    { delay: 3800, log: "[4/6] Installing dependencies … ✅ torch 2.3.1, transformers 4.41.2, evaluate, jiwer" },
+    { delay: 4500, log: "[5/6] Verifying MPS in PyTorch … ✅ MPS available — GPU acceleration active" },
+    { delay: 5200, log: `[6/6] Checking dataset … Total verified clips: ${trainingTelemetry.sampleCount}` },
+    { delay: 6000, log: "  ── Dataset Report: 100% audio verified, vocabulary checked" },
+    { delay: 6800, log: "[1/5] Splitting dataset … Train: 148  |  Val: 28 held-out" },
+    { delay: 7600, log: "[2/5] Loading processor for openai/whisper-small.en …" },
+    { delay: 8400, log: "[3/5] Preprocessing audio … 🔀 Augmentation ON (~704 effective samples)" },
+    { delay: 9200, log: "[4/5] Loading model … WhisperForConditionalGeneration ready on MPS" },
+    { delay: 10000, log: "[5/5] Training … Starting AdamW cosine schedule" }
+  ];
+
+  let stepIdx = 0;
+  simulationInterval = setInterval(() => {
+    if (stepIdx < simSteps.length) {
+      pushTrainingLog(simSteps[stepIdx].log);
+      stepIdx++;
+    } else {
+      // Advance epochs
+      trainingTelemetry.status = 'training';
+      const curEp = trainingTelemetry.currentEpoch + 1;
+      if (curEp <= epochs) {
+        trainingTelemetry.currentEpoch = curEp;
+        trainingTelemetry.currentStep = curEp * 20;
+
+        const baseLoss = 0.95 * Math.exp(-0.35 * curEp) + 0.12;
+        const jitter = (Math.random() - 0.5) * 0.03;
+        const tLoss = Math.max(0.08, Number((baseLoss + jitter).toFixed(4)));
+        const eLoss = Math.max(0.11, Number((baseLoss * 1.08 + jitter).toFixed(4)));
+        const wer = Math.max(0.09, Number((0.55 * Math.exp(-0.32 * curEp) + 0.08).toFixed(3)));
+
+        trainingTelemetry.trainLoss = tLoss;
+        trainingTelemetry.evalLoss = eLoss;
+        trainingTelemetry.evalWer = wer;
+        if (trainingTelemetry.bestWer === null || wer < trainingTelemetry.bestWer) {
+          trainingTelemetry.bestWer = wer;
+        }
+
+        const point: MetricPoint = {
+          epoch: curEp,
+          step: trainingTelemetry.currentStep,
+          trainLoss: tLoss,
+          evalLoss: eLoss,
+          evalWer: wer,
+          learningRate: parseFloat(lr) * Math.cos((curEp / epochs) * (Math.PI / 2)),
+          timestamp: new Date().toLocaleTimeString()
+        };
+        trainingTelemetry.history.push(point);
+
+        pushTrainingLog(`{'loss': ${tLoss}, 'learning_rate': ${point.learningRate?.toExponential(2)}, 'epoch': ${curEp}.0}`);
+        pushTrainingLog(`{'eval_loss': ${eLoss}, 'eval_wer': ${(wer * 100).toFixed(1)}%, 'epoch': ${curEp}.0}  [Best WER: ${((trainingTelemetry.bestWer || wer) * 100).toFixed(1)}%]`);
+        trainingTelemetry.phase = `Epoch ${curEp}/${epochs} · Loss: ${tLoss} · WER: ${(wer * 100).toFixed(1)}%`;
+      } else {
+        // Complete
+        clearInterval(simulationInterval);
+        simulationInterval = null;
+        trainingTelemetry.status = 'completed';
+        trainingTelemetry.phase = `Training Complete! Best WER: ${((trainingTelemetry.bestWer || 0.118) * 100).toFixed(1)}%`;
+        trainingTelemetry.endTime = Date.now();
+        pushTrainingLog("============================================================");
+        pushTrainingLog("  ✅ Training complete!");
+        pushTrainingLog("  Model Saved  → ./whisper-paxton-final/");
+        pushTrainingLog("  Manifest     → ./whisper-paxton-final/training_manifest.json");
+        pushTrainingLog(`  Best WER     → ${((trainingTelemetry.bestWer || 0.118) * 100).toFixed(1)}%`);
+        pushTrainingLog("============================================================");
+      }
+    }
+  }, 1200);
+
+  res.json({ success: true, message: 'Simulation session initiated.' });
+});
+
+app.post('/api/training/start', async (req, res) => {
+  try {
+    const { sampleCount } = buildDatasetCsv();
     
     if (sampleCount < 5) {
-       console.log(`[⚠️] Not enough audio samples for a meaningful test. Please finalize at least 5 audio items.`);
-       return res.json({ success: false, message: `Need at least 5 audio samples to begin (Current: ${sampleCount}). Finalize more in the pipeline.` });
+      return res.status(400).json({ 
+        success: false, 
+        message: `Need at least 5 audio samples to train (Current: ${sampleCount}). Finalize more in the audio pipeline.` 
+      });
     }
-    
-    console.log(`--> Spawning Python training pipeline to actually finetune Whisper...`);
-    
-    // Ensure scripts are executable
-    if (fs.existsSync('run_training.sh')) {
-       fs.chmodSync('run_training.sh', 0o755);
-    }
-    
-    const transcriptMode = appSettings.trainingMode || 'phonetic';
-    
-    const trainProcess = spawn('bash', [
-       'run_training.sh', 
-       (appSettings.trainingEpochs || 15).toString(), 
-       (appSettings.trainingLR || '5e-6').toString(),
-       (appSettings.trainingBatchSize || 8).toString(),
-       transcriptMode
-    ], { cwd: process.cwd(), detached: true, stdio: 'ignore' });
-    trainProcess.unref();
 
-    let message = `Real Whisper training session initiated on ${sampleCount} samples using Python/HuggingFace! Check training.log for live progress.`;
-    res.json({ success: true, message: message });
+    const epochs = Number(req.body.epochs) || appSettings.trainingEpochs || 15;
+    const lr = req.body.lr || appSettings.trainingLR || '5e-6';
+    const batchSize = Number(req.body.batchSize) || appSettings.trainingBatchSize || 8;
+    const mode = req.body.mode || appSettings.trainingMode || 'phonetic';
+
+    // Stop existing if any
+    if (activeTrainProcess) {
+      try { activeTrainProcess.kill(); } catch(e) {}
+    }
+    if (simulationInterval) {
+      clearInterval(simulationInterval);
+      simulationInterval = null;
+    }
+
+    trainingTelemetry = {
+      status: 'preparing',
+      phase: 'Initiating Fine-Tuning Pipeline …',
+      currentEpoch: 0,
+      totalEpochs: epochs,
+      currentStep: 0,
+      totalSteps: epochs * Math.max(1, Math.ceil(sampleCount / batchSize)),
+      trainLoss: null,
+      evalLoss: null,
+      evalWer: null,
+      bestWer: null,
+      history: [],
+      sampleCount,
+      device: 'Detecting...',
+      modelName: 'openai/whisper-small.en',
+      transcriptMode: mode,
+      startTime: Date.now(),
+      endTime: null,
+      elapsedSeconds: 0,
+      estimatedRemainingSeconds: null,
+      logs: [],
+      totalLogLines: 0,
+      error: null,
+      isSimulated: false
+    };
+
+    pushTrainingLog(`[🚀 INITIALIZING] Preparing local Whisper fine-tuning run for Paxton...`);
+    pushTrainingLog(`--> Dataset samples: ${sampleCount} clips exported to dataset/metadata.csv`);
+    pushTrainingLog(`--> Parameters: epochs=${epochs}, lr=${lr}, batch_size=${batchSize}, mode=${mode}`);
+
+    if (fs.existsSync('run_training.sh')) {
+      try { fs.chmodSync('run_training.sh', 0o755); } catch(e) {}
+    }
+
+    activeTrainProcess = spawn('bash', [
+      'run_training.sh',
+      epochs.toString(),
+      lr.toString(),
+      batchSize.toString(),
+      mode
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    });
+
+    activeTrainProcess.stdout.on('data', (data: Buffer) => {
+      const text = data.toString();
+      text.split('\n').forEach(pushTrainingLog);
+    });
+
+    activeTrainProcess.stderr.on('data', (data: Buffer) => {
+      const text = data.toString();
+      text.split('\n').forEach(pushTrainingLog);
+    });
+
+    activeTrainProcess.on('close', (code: number) => {
+      activeTrainProcess = null;
+      trainingTelemetry.endTime = Date.now();
+      if (code === 0) {
+        trainingTelemetry.status = 'completed';
+        trainingTelemetry.phase = 'Training Complete — Weights Exported';
+        pushTrainingLog(`[✅ SUCCESS] Process finished cleanly with exit code 0`);
+      } else {
+        trainingTelemetry.status = 'failed';
+        trainingTelemetry.phase = `Process exited with code ${code}`;
+        pushTrainingLog(`[❌ FAILED] Process exited with code ${code}`);
+      }
+    });
+
+    res.json({ success: true, message: `Training launched on ${sampleCount} samples.` });
+  } catch(e) {
+    console.error('Failed to start training:', e);
+    res.status(500).json({ success: false, error: 'Could not launch training pipeline' });
+  }
+});
+
+app.get('/api/training/checkpoints', (req, res) => {
+  const artifacts: any[] = [];
+  const checkDir = path.join(process.cwd(), 'whisper-paxton-checkpoints');
+  const finalDir = path.join(process.cwd(), 'whisper-paxton-final');
+
+  if (fs.existsSync(finalDir)) {
+    let manifest: any = {};
+    const manifestPath = path.join(finalDir, 'training_manifest.json');
+    if (fs.existsSync(manifestPath)) {
+      try {
+        manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      } catch(e) {}
+    }
+
+    artifacts.push({
+      id: 'final',
+      name: 'whisper-paxton-final',
+      path: finalDir,
+      type: 'Final Release Model',
+      date: fs.statSync(finalDir).mtime.toISOString(),
+      manifest,
+      isFinal: true
+    });
+  }
+
+  if (fs.existsSync(checkDir)) {
+    try {
+      const entries = fs.readdirSync(checkDir);
+      for (const entry of entries) {
+        const full = path.join(checkDir, entry);
+        if (fs.statSync(full).isDirectory()) {
+          artifacts.push({
+            id: entry,
+            name: entry,
+            path: full,
+            type: 'Intermediate Checkpoint',
+            date: fs.statSync(full).mtime.toISOString(),
+            isFinal: false
+          });
+        }
+      }
+    } catch(e) {}
+  }
+
+  res.json(artifacts);
+});
+
+// Legacy backward-compatible endpoint
+app.post('/api/train-models', async (req, res) => {
+  console.log(`\n[🚀 WHISPER TRAINING & DATASET BUILD INITIATED]`);
+  try {
+    const { sampleCount } = buildDatasetCsv();
+    if (sampleCount < 5) {
+      return res.json({ success: false, message: `Need at least 5 audio samples to begin (Current: ${sampleCount}). Finalize more in the pipeline.` });
+    }
+    // Launch training through unified manager
+    const epochs = appSettings.trainingEpochs || 15;
+    const lr = appSettings.trainingLR || '5e-6';
+    const batchSize = appSettings.trainingBatchSize || 8;
+    const mode = appSettings.trainingMode || 'phonetic';
+
+    trainingTelemetry = {
+      status: 'preparing',
+      phase: 'Initiating Fine-Tuning Pipeline …',
+      currentEpoch: 0,
+      totalEpochs: epochs,
+      currentStep: 0,
+      totalSteps: epochs * Math.max(1, Math.ceil(sampleCount / batchSize)),
+      trainLoss: null,
+      evalLoss: null,
+      evalWer: null,
+      bestWer: null,
+      history: [],
+      sampleCount,
+      device: 'Detecting...',
+      modelName: 'openai/whisper-small.en',
+      transcriptMode: mode,
+      startTime: Date.now(),
+      endTime: null,
+      elapsedSeconds: 0,
+      estimatedRemainingSeconds: null,
+      logs: [],
+      totalLogLines: 0,
+      error: null,
+      isSimulated: false
+    };
+
+    activeTrainProcess = spawn('bash', [
+      'run_training.sh',
+      epochs.toString(),
+      lr.toString(),
+      batchSize.toString(),
+      mode
+    ], {
+      cwd: process.cwd(),
+      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    });
+
+    activeTrainProcess.stdout.on('data', (d: Buffer) => d.toString().split('\n').forEach(pushTrainingLog));
+    activeTrainProcess.stderr.on('data', (d: Buffer) => d.toString().split('\n').forEach(pushTrainingLog));
+    activeTrainProcess.on('close', (code: number) => {
+      activeTrainProcess = null;
+      trainingTelemetry.status = code === 0 ? 'completed' : 'failed';
+    });
+
+    res.json({ success: true, message: `Whisper training started on ${sampleCount} samples! Open the Model Training Studio to watch live telemetry.` });
   } catch(e) {
     console.error("Dataset optimization failed", e);
     res.status(500).json({ error: 'Failed to compile datasets' });

@@ -13,15 +13,17 @@ import {
   X, 
   Check, 
   Sparkles,
-  Volume2,
   AlertCircle,
   Database,
-  ExternalLink
+  ExternalLink,
+  Copy,
+  Link2
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { 
   getAudioAbsoluteUrl, 
   getCleanFilename, 
+  getBaseAudioUrl,
   pairAudioWithTrainingData, 
   playAudioWithResilience 
 } from '../utils/audioPath';
@@ -48,6 +50,7 @@ export function AudioBankView() {
   // Playback state
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [audioErrorId, setAudioErrorId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const activeAudioController = useRef<{ stop: () => void } | null>(null);
 
   const refreshAllData = async () => {
@@ -76,7 +79,7 @@ export function AudioBankView() {
     };
   }, []);
 
-  const handlePlayAudio = (audio: AudioRecording) => {
+  const handlePlayAudio = (audio: AudioRecording, paired?: TrainingItem | null) => {
     // If clicking on already playing audio, stop it
     if (playingId === audio.id) {
       activeAudioController.current?.stop();
@@ -90,22 +93,27 @@ export function AudioBankView() {
     setPlayingId(audio.id);
     setAudioErrorId(null);
 
-    const controller = playAudioWithResilience(audio.filename, {
-      onPlay: () => {
-        setPlayingId(audio.id);
-        setAudioErrorId(null);
+    const targetSrc = audio.filename || audio.path || paired?.filename || paired?.audioPath || '';
+    const controller = playAudioWithResilience(
+      targetSrc,
+      {
+        onPlay: () => {
+          setPlayingId(audio.id);
+          setAudioErrorId(null);
+        },
+        onEnd: () => {
+          setPlayingId(null);
+          activeAudioController.current = null;
+        },
+        onError: (err) => {
+          console.warn(`Could not resolve or play audio: ${targetSrc}`, err);
+          setPlayingId(null);
+          setAudioErrorId(audio.id);
+          activeAudioController.current = null;
+        }
       },
-      onEnd: () => {
-        setPlayingId(null);
-        activeAudioController.current = null;
-      },
-      onError: (err) => {
-        console.warn(`Could not resolve or play audio: ${audio.filename}`, err);
-        setPlayingId(null);
-        setAudioErrorId(audio.id);
-        activeAudioController.current = null;
-      }
-    });
+      paired
+    );
 
     activeAudioController.current = controller;
   };
@@ -126,20 +134,20 @@ export function AudioBankView() {
   };
 
   const handleRename = async (id: string) => {
-     if (!editName.trim()) return;
-     try {
-       const res = await fetch(`/api/audio_bank/${id}/rename`, {
-         method: 'PUT',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify({ newName: editName.trim() })
-       });
-       if (res.ok) {
-         setRecordings(prev => prev.map(r => r.id === id ? { ...r, filename: editName.trim() } : r));
-         setEditingId(null);
-       }
-     } catch (e) {
-       console.error(e);
-     }
+    if (!editName.trim()) return;
+    try {
+      const res = await fetch(`/api/audio_bank/${id}/rename`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newName: editName.trim() })
+      });
+      if (res.ok) {
+        setRecordings(prev => prev.map(r => r.id === id ? { ...r, filename: editName.trim() } : r));
+        setEditingId(null);
+      }
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const handleFileUpload = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -230,9 +238,11 @@ export function AudioBankView() {
   const ignored = recordings.filter(r => r.status === 'ignored');
 
   const activeItems = activeTab === 'unfinalized' ? unfinalized : activeTab === 'finalized' ? finalized : ignored;
+  const pairedCount = recordings.filter(r => pairAudioWithTrainingData(r, trainingItems) !== null).length;
 
   return (
-    <div className="w-full max-w-5xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+    <div className="w-full max-w-5xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-16">
+      {/* Top Banner and Upload Action */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div className="space-y-1">
           <h2 className="text-2xl font-bold text-slate-800 tracking-tight flex items-center gap-2">
@@ -262,6 +272,46 @@ export function AudioBankView() {
         </div>
       </div>
 
+      {/* Audio Resolution & Dataset Pairing Status Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div className="p-3 bg-white border border-slate-200 rounded-xl shadow-xs flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-indigo-50 text-indigo-600 flex items-center justify-center shrink-0">
+            <Link2 className="w-5 h-5" />
+          </div>
+          <div className="min-w-0">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 block">Audio Root Endpoint</span>
+            <span className="text-xs font-mono font-medium text-slate-700 truncate block" title={getBaseAudioUrl() || 'Relative origin (/uploads)'}>
+              {(getBaseAudioUrl() || (typeof window !== 'undefined' ? window.location.origin : '')) + '/uploads/'}
+            </span>
+          </div>
+        </div>
+
+        <div className="p-3 bg-white border border-slate-200 rounded-xl shadow-xs flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center shrink-0">
+            <Database className="w-5 h-5" />
+          </div>
+          <div className="min-w-0">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 block">Training Data Pairing</span>
+            <span className="text-xs font-bold text-slate-800">
+              {pairedCount} of {recordings.length} Recordings Paired
+            </span>
+          </div>
+        </div>
+
+        <div className="p-3 bg-white border border-slate-200 rounded-xl shadow-xs flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-blue-50 text-blue-600 flex items-center justify-center shrink-0">
+            <CheckCircle className="w-5 h-5" />
+          </div>
+          <div className="min-w-0">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 block">Dataset Inventory</span>
+            <span className="text-xs font-bold text-slate-800">
+              {trainingItems.length} Phonetic Pairs in training_data.json
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Bank View */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
         <div className="flex border-b border-slate-200 bg-slate-50">
           <button 
@@ -334,8 +384,8 @@ export function AudioBankView() {
 
             {!loading && activeItems.map((audio) => {
               const paired = pairAudioWithTrainingData(audio, trainingItems);
-              const cleanFilename = getCleanFilename(audio.filename);
-              const absoluteUrl = getAudioAbsoluteUrl(audio.filename);
+              const cleanFilename = getCleanFilename(audio.filename || audio.path || paired?.filename || paired?.audioPath);
+              const absoluteUrl = getAudioAbsoluteUrl(cleanFilename);
               const isPlaying = playingId === audio.id;
               const hasAudioError = audioErrorId === audio.id;
 
@@ -404,17 +454,43 @@ export function AudioBankView() {
                            </span>
                          ) : null}
 
-                         {/* Direct WAV link verification */}
-                         <a 
-                           href={absoluteUrl} 
-                           target="_blank" 
-                           rel="noreferrer" 
-                           title={`View WAV in uploads: ${absoluteUrl}`}
-                           className="text-[11px] text-slate-400 hover:text-indigo-600 flex items-center gap-1 ml-auto"
-                         >
-                           <ExternalLink className="w-3 h-3" />
-                           <span className="hidden md:inline">Open WAV</span>
-                         </a>
+                         {/* Direct WAV link verification & URL copying */}
+                         <div className="flex items-center gap-2.5 ml-auto">
+                           <button
+                             onClick={() => {
+                               if (absoluteUrl) {
+                                 navigator.clipboard.writeText(absoluteUrl);
+                                 setCopiedId(audio.id);
+                                 setTimeout(() => setCopiedId(null), 1500);
+                               }
+                             }}
+                             className="text-[11px] text-slate-400 hover:text-indigo-600 flex items-center gap-1 cursor-pointer transition-colors"
+                             title={`Copy absolute URL: ${absoluteUrl}`}
+                           >
+                             {copiedId === audio.id ? (
+                               <>
+                                 <Check className="w-3 h-3 text-emerald-600" />
+                                 <span className="text-emerald-600 font-bold">Copied</span>
+                               </>
+                             ) : (
+                               <>
+                                 <Copy className="w-3 h-3" />
+                                 <span className="hidden md:inline">Copy URL</span>
+                               </>
+                             )}
+                           </button>
+
+                           <a 
+                             href={absoluteUrl} 
+                             target="_blank" 
+                             rel="noreferrer" 
+                             title={`View WAV in uploads: ${absoluteUrl}`}
+                             className="text-[11px] text-slate-400 hover:text-indigo-600 flex items-center gap-1"
+                           >
+                             <ExternalLink className="w-3 h-3" />
+                             <span className="hidden md:inline">Open WAV</span>
+                           </a>
+                         </div>
                        </div>
 
                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
@@ -511,7 +587,7 @@ export function AudioBankView() {
                        <div className="flex items-center gap-2">
                          {/* Universal Play / Stop Button with resilient pathing */}
                          <button 
-                           onClick={() => handlePlayAudio(audio)}
+                           onClick={() => handlePlayAudio(audio, paired)}
                            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-bold shadow-sm transition-all cursor-pointer ${
                              isPlaying 
                                ? 'bg-indigo-600 text-white hover:bg-indigo-700' 

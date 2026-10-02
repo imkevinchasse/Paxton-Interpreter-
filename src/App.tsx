@@ -4,6 +4,7 @@ import { Microphone } from './components/Microphone';
 import { ProcessingView, HighConfidenceView, MediumConfidenceView, LowConfidenceView } from './components/InterpreterViews';
 import { SettingsView } from './components/SettingsView';
 import { TrainingStudio } from './components/TrainingStudio';
+import { TrainingStudioView } from './components/TrainingStudioView';
 import { AudioBankView } from './components/AudioBankView';
 import { DictionaryView } from './components/DictionaryView';
 import { type Interaction, type PipelineResult, type ViewState } from './types';
@@ -112,6 +113,10 @@ export default function App() {
                { result && result.mode === 'choice' && <MediumConfidenceView result={result} onSelect={(id, txt) => finalizeInteraction(txt, id)} /> }
                { result && result.mode === 'clarification' && <LowConfidenceView result={result} onSubmit={(txt) => finalizeInteraction(txt, null)} /> }
              </div>
+           )}
+
+           {currentView === 'training_studio' && (
+             <TrainingStudioView />
            )}
 
            {currentView === 'training' && (

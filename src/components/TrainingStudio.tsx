@@ -144,7 +144,7 @@ export function TrainingStudio() {
                    value={sound}
                    onChange={e => setSound(e.target.value)}
                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all font-medium shadow-inner"
-                   placeholder="e.g. 'I lie ba-man' or 'HAUGHMANPAPET'R TAWL'"
+                   placeholder="e.g. 'I lie ba-man' or 'HAUGHMANPAPET\'R TAWL'"
                  />
               </div>
 
@@ -262,15 +262,15 @@ export function TrainingStudio() {
              <p className="text-xs text-slate-500 font-mono bg-white p-4 border border-slate-200 border-dashed rounded-xl text-center">No data collected this session.</p>
            )}
            <div className="space-y-3 max-h-64 overflow-y-auto pr-2">
-             {savedItems.map((item, i) => (
+             {savedItems.map((item) => (
                <div key={item.id} className="bg-white border border-slate-200 p-4 rounded-xl shadow-sm space-y-2 group">
                   <div className="flex justify-between items-center">
                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{item.category}</span>
                      <div className="flex items-center space-x-2">
-                       {item.filename && (
+                       {(item.filename || item.audioPath) && (
                          <button 
                            onClick={() => {
-                             playAudioWithResilience(item.filename!);
+                             playAudioWithResilience(item.filename || item.audioPath!, undefined, item);
                            }}
                            className="text-slate-400 hover:text-indigo-500 transition-colors cursor-pointer"
                            title="Play Original Audio"
@@ -278,8 +278,8 @@ export function TrainingStudio() {
                            <Mic className="w-4 h-4" />
                          </button>
                        )}
-                       {!item.filename && item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
-                       <button onClick={() => handleDelete(item.id)} className="text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100">
+                       {!(item.filename || item.audioPath) && item.hasAudio && <Mic className="w-4 h-4 text-emerald-500" />}
+                       <button onClick={() => handleDelete(item.id)} className="text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100 cursor-pointer">
                          <Trash2 className="w-4 h-4" />
                        </button>
                      </div>

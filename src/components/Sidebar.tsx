@@ -1,5 +1,5 @@
 import { type Interaction, type ViewState } from '../types';
-import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA } from 'lucide-react';
+import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart } from 'lucide-react';
 
 interface SidebarProps { 
   interactions: Interaction[];
@@ -26,7 +26,7 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
         <div className="flex flex-col gap-2">
           <button 
             onClick={() => onViewChange('interpreter')}
-            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
+            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
               currentView === 'interpreter' 
                 ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'
@@ -34,10 +34,27 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
           >
             <Activity className="w-4 h-4" /> Live Interpreter
           </button>
+
+          <button 
+            onClick={() => onViewChange('training_studio')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'training_studio' 
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <LineChart className="w-4 h-4 text-indigo-600" />
+              <span>Training Studio</span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+              Live
+            </span>
+          </button>
           
           <button 
             onClick={() => onViewChange('training')}
-            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
+            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
               currentView === 'training' 
                 ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'

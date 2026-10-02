@@ -56,6 +56,8 @@ export interface AudioRecording {
   sound?: string;
   meaning?: string;
   isCut?: boolean;
+  path?: string;
+  audioPath?: string;
 }
 
 export interface DictionaryItem {
@@ -65,4 +67,39 @@ export interface DictionaryItem {
   context?: string;
 }
 
-export type ViewState = 'interpreter' | 'training' | 'settings' | 'audiobank' | 'dictionary';
+export interface TrainingMetricPoint {
+  epoch: number;
+  step: number;
+  trainLoss?: number;
+  evalLoss?: number;
+  evalWer?: number;
+  learningRate?: number;
+  timestamp: string;
+}
+
+export interface TrainingTelemetry {
+  status: 'idle' | 'preparing' | 'training' | 'completed' | 'failed';
+  phase: string;
+  currentEpoch: number;
+  totalEpochs: number;
+  currentStep: number;
+  totalSteps: number;
+  trainLoss: number | null;
+  evalLoss: number | null;
+  evalWer: number | null;
+  bestWer: number | null;
+  history: TrainingMetricPoint[];
+  sampleCount: number;
+  device: string;
+  modelName: string;
+  transcriptMode: string;
+  startTime: number | null;
+  elapsedSeconds: number;
+  estimatedRemainingSeconds: number | null;
+  logs: string[];
+  totalLogLines: number;
+  error?: string | null;
+  isSimulated?: boolean;
+}
+
+export type ViewState = 'interpreter' | 'training_studio' | 'training' | 'settings' | 'audiobank' | 'dictionary';

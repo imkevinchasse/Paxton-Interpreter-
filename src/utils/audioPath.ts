@@ -1,6 +1,19 @@
 import { type AudioRecording, type TrainingItem } from '../types';
 
 /**
+ * Normalizes text for lenient comparison:
+ * lowercase, removes non-alphanumeric punctuation, collapses spaces.
+ */
+export function normalizeAcousticText(input?: string | null): string {
+  if (!input) return '';
+  return String(input)
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Extracts a clean, normalized filename from an audioPath, URL, or raw filename.
  * Strips leading directory segments like 'uploads/', '/uploads/', or full system paths.
  */
@@ -24,7 +37,7 @@ export function getCleanFilename(input?: string | null): string {
   // Convert Windows backslashes to forward slashes
   str = str.replace(/\\/g, '/');
 
-  // Remove leading slashes and common upload folder prefixes
+  // Strip leading slashes and common upload folder prefixes
   str = str.replace(/^\/+/, '');
   str = str.replace(/^uploads\//i, '');
 
@@ -45,7 +58,22 @@ export function getCleanFilename(input?: string | null): string {
 }
 
 /**
+ * Strips Unix timestamps often added by upload handlers (e.g. 1781008695871-snippet.wav -> snippet.wav)
+ */
+export function stripTimestampPrefix(filename: string): string {
+  return filename.replace(/^\d{10,14}[-_]/, '');
+}
+
+/**
+ * Strips common audio extensions for name-stem comparison
+ */
+export function stripAudioExtension(filename: string): string {
+  return filename.replace(/\.(wav|webm|mp3|ogg|m4a|aac)$/i, '');
+}
+
+/**
  * Resolves the base origin or endpoint URL from environment variables or browser context.
+ * Checks VITE_AUDIO_BASE_URL first, then VITE_API_BASE_URL, then window.location.origin.
  */
 export function getBaseAudioUrl(): string {
   // Check for explicitly configured base URLs in Vite environment
@@ -104,21 +132,67 @@ export function getAudioBankApiUrl(filenameOrPath?: string | null): string {
 
 /**
  * Returns prioritized array of candidate URLs to resolve and fetch the WAV file.
+ * Handles timestamp variations and paired training item aliases.
  */
-export function getAudioCandidateUrls(filenameOrPath?: string | null): string[] {
-  const clean = getCleanFilename(filenameOrPath);
-  if (!clean) return [];
+export function getAudioCandidateUrls(
+  filenameOrPath?: string | null,
+  pairedItem?: TrainingItem | null
+): string[] {
+  const candidates: string[] = [];
+  const namesToTry = new Set<string>();
 
-  const primary = getAudioAbsoluteUrl(clean);
-  const fallback = getAudioFallbackUrl(clean);
-  const bankFallback = getAudioBankApiUrl(clean);
+  const primaryClean = getCleanFilename(filenameOrPath);
+  if (primaryClean) {
+    namesToTry.add(primaryClean);
+    const unPrefixed = stripTimestampPrefix(primaryClean);
+    if (unPrefixed && unPrefixed !== primaryClean) {
+      namesToTry.add(unPrefixed);
+    }
+    // Also try adding .wav if missing
+    if (!primaryClean.includes('.')) {
+      namesToTry.add(`${primaryClean}.wav`);
+    }
+  }
 
-  // Return unique candidate URLs
-  return Array.from(new Set([primary, fallback, bankFallback]));
+  // Also try names from paired training item if available
+  if (pairedItem) {
+    const pairedFilename = getCleanFilename(pairedItem.filename);
+    const pairedAudioPath = getCleanFilename(pairedItem.audioPath);
+    if (pairedFilename) {
+      namesToTry.add(pairedFilename);
+      namesToTry.add(stripTimestampPrefix(pairedFilename));
+    }
+    if (pairedAudioPath) {
+      namesToTry.add(pairedAudioPath);
+      namesToTry.add(stripTimestampPrefix(pairedAudioPath));
+    }
+  }
+
+  const base = getBaseAudioUrl();
+
+  for (const name of namesToTry) {
+    const encoded = encodeURIComponent(name);
+    // 1. Direct uploads folder route
+    candidates.push(base ? `${base}/uploads/${encoded}` : `/uploads/${encoded}`);
+    // 2. Training data audio API endpoint
+    candidates.push(base ? `${base}/api/training_data/audio/${encoded}` : `/api/training_data/audio/${encoded}`);
+    // 3. Audio bank endpoint
+    candidates.push(base ? `${base}/api/audio_bank/audio/${encoded}` : `/api/audio_bank/audio/${encoded}`);
+  }
+
+  // Deduplicate preserving order
+  return Array.from(new Set(candidates));
 }
 
 /**
  * Matches an AudioRecording from the audio bank with its corresponding TrainingItem in training_data.json.
+ * Uses a multi-tiered matching strategy to ensure robust pairing:
+ * 1. Exact cleaned filename match
+ * 2. Timestamp-stripped filename match (1781008695871-snippet.wav vs snippet.wav)
+ * 3. Base stem match (without .wav extension)
+ * 4. ID match
+ * 5. Normalized phonetic sound match (Whisper acoustic transcript)
+ * 6. Normalized intended meaning match
  */
 export function pairAudioWithTrainingData(
   audio: AudioRecording,
@@ -126,46 +200,109 @@ export function pairAudioWithTrainingData(
 ): TrainingItem | null {
   if (!audio || !trainingItems || trainingItems.length === 0) return null;
 
-  const audioCleanName = getCleanFilename(audio.filename);
+  const audioCleanName = getCleanFilename(audio.filename || audio.path);
+  const audioStem = audioCleanName ? stripAudioExtension(stripTimestampPrefix(audioCleanName)) : '';
 
   // 1. Direct match on cleaned filename
   if (audioCleanName) {
     const filenameMatch = trainingItems.find(t => {
-      const tClean = getCleanFilename(t.filename) || getCleanFilename(t.audioPath);
-      return tClean === audioCleanName;
+      const tClean = getCleanFilename(t.filename || t.audioPath);
+      return tClean && tClean === audioCleanName;
     });
     if (filenameMatch) return filenameMatch;
   }
 
-  // 2. Direct match on ID
+  // 2. Timestamp-stripped filename match
+  if (audioCleanName) {
+    const audioUnprefixed = stripTimestampPrefix(audioCleanName);
+    const unprefixMatch = trainingItems.find(t => {
+      const tClean = getCleanFilename(t.filename || t.audioPath);
+      if (!tClean) return false;
+      return stripTimestampPrefix(tClean) === audioUnprefixed;
+    });
+    if (unprefixMatch) return unprefixMatch;
+  }
+
+  // 3. Stem match (e.g. ZOOM0003_LR_snippet_2)
+  if (audioStem && audioStem.length > 3) {
+    const stemMatch = trainingItems.find(t => {
+      const tClean = getCleanFilename(t.filename || t.audioPath);
+      if (!tClean) return false;
+      const tStem = stripAudioExtension(stripTimestampPrefix(tClean));
+      return tStem === audioStem;
+    });
+    if (stemMatch) return stemMatch;
+  }
+
+  // 4. Direct match on ID
   if (audio.id) {
     const idMatch = trainingItems.find(t => t.id === audio.id);
     if (idMatch) return idMatch;
   }
 
-  // 3. Exact match on both phonetic sound and target intent meaning
-  const audioSound = (audio.sound || '').trim().toLowerCase();
-  const audioMeaning = (audio.meaning || '').trim().toLowerCase();
+  // 5. Match on exact phonetic sound and meaning pair
+  const normAudioSound = normalizeAcousticText(audio.sound);
+  const normAudioMeaning = normalizeAcousticText(audio.meaning);
 
-  if (audioSound && audioMeaning) {
+  if (normAudioSound && normAudioMeaning) {
     const exactPairMatch = trainingItems.find(t => {
-      const tSound = (t.sound || '').trim().toLowerCase();
-      const tMeaning = (t.meaning || '').trim().toLowerCase();
-      return tSound === audioSound && tMeaning === audioMeaning;
+      return (
+        normalizeAcousticText(t.sound) === normAudioSound &&
+        normalizeAcousticText(t.meaning) === normAudioMeaning
+      );
     });
     if (exactPairMatch) return exactPairMatch;
   }
 
-  // 4. Match on sound alone if meaning is missing or vice-versa
-  if (audioMeaning) {
+  // 6. Match on normalized phonetic sound alone (Crucial for unfinalized snippets transcribed by Whisper)
+  if (normAudioSound && normAudioSound.length >= 3) {
+    const soundMatch = trainingItems.find(t => {
+      const tSound = normalizeAcousticText(t.sound);
+      return tSound && (tSound === normAudioSound || tSound.includes(normAudioSound) || normAudioSound.includes(tSound));
+    });
+    if (soundMatch) return soundMatch;
+  }
+
+  // 7. Match on target intent meaning alone
+  if (normAudioMeaning && normAudioMeaning.length >= 3) {
     const meaningMatch = trainingItems.find(t => {
-      const tMeaning = (t.meaning || '').trim().toLowerCase();
-      return tMeaning === audioMeaning;
+      const tMeaning = normalizeAcousticText(t.meaning);
+      return tMeaning && (tMeaning === normAudioMeaning || tMeaning.includes(normAudioMeaning) || normAudioMeaning.includes(tMeaning));
     });
     if (meaningMatch) return meaningMatch;
   }
 
   return null;
+}
+
+/**
+ * Checks if a given audio file is accessible and reachable via HTTP.
+ * Tests candidate URLs until one responds with status 200 or 206.
+ */
+export async function verifyAudioReachable(
+  filenameOrPath: string,
+  pairedItem?: TrainingItem | null
+): Promise<{ reachable: boolean; resolvedUrl: string | null }> {
+  const candidateUrls = getAudioCandidateUrls(filenameOrPath, pairedItem);
+  if (candidateUrls.length === 0) {
+    return { reachable: false, resolvedUrl: null };
+  }
+
+  for (const url of candidateUrls) {
+    try {
+      const res = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'Range': 'bytes=0-1' }
+      });
+      if (res.ok || res.status === 206 || res.status === 304) {
+        return { reachable: true, resolvedUrl: url };
+      }
+    } catch {
+      // Continue to next candidate
+    }
+  }
+
+  return { reachable: false, resolvedUrl: null };
 }
 
 /**
@@ -177,9 +314,10 @@ export function playAudioWithResilience(
     onPlay?: () => void;
     onEnd?: () => void;
     onError?: (err: Error) => void;
-  }
+  },
+  pairedItem?: TrainingItem | null
 ): { audio: HTMLAudioElement; stop: () => void } {
-  const candidateUrls = getAudioCandidateUrls(filenameOrPath);
+  const candidateUrls = getAudioCandidateUrls(filenameOrPath, pairedItem);
   let currentIndex = 0;
 
   const audio = new Audio();

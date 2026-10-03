@@ -226,6 +226,26 @@ def main():
 
     df["_label"] = df[label_col].apply(clean_transcript)
 
+    # Resolve audio file paths (supports dataset/ prefix, bare filenames, or uploads)
+    def resolve_audio_file(p):
+        if not p or not isinstance(p, str):
+            return ""
+        s = str(p).strip()
+        if os.path.exists(s):
+            return s
+        c1 = os.path.join(DATASET_DIR, s)
+        if os.path.exists(c1):
+            return c1
+        c2 = os.path.join(DATASET_DIR, os.path.basename(s))
+        if os.path.exists(c2):
+            return c2
+        c3 = os.path.join("uploads", os.path.basename(s))
+        if os.path.exists(c3):
+            return c3
+        return s
+
+    df["file_name"] = df["file_name"].apply(resolve_audio_file)
+
     # Drop rows with no audio path or empty label
     before = len(df)
     df = df[df["file_name"].notna() & (df["_label"].str.len() > 0)].reset_index(drop=True)
@@ -343,13 +363,11 @@ def main():
         load_best_model_at_end      = True,
         metric_for_best_model       = "wer",
         greater_is_better           = False,
-        **extra_eval_args
-    )
         push_to_hub                 = False,
         dataloader_pin_memory       = False,      # MPS requirement
         optim                       = "adamw_torch",
-        # Keep only the 3 best checkpoints to save disk space
-        save_total_limit            = 3,
+        save_total_limit            = 3,          # Keep only the 3 best checkpoints
+        **extra_eval_args
     )
 
     collator = PaddingCollator(processor=processor)

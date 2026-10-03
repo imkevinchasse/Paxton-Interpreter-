@@ -4,12 +4,13 @@ import multer from 'multer';
 import fs from 'fs';
 import os from 'os';
 import util from 'util';
-import { fileURLToPath } from 'url';
 import { exec, spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Safe directory resolution compatible with both CommonJS (dist/server.cjs) and ES modules
+const currentDir = typeof __dirname !== 'undefined'
+  ? __dirname
+  : (typeof process !== 'undefined' ? process.cwd() : '.');
 const execAsync = util.promisify(exec);
 
 const app = express();
@@ -429,7 +430,7 @@ const sendAudioFile = (req: express.Request, res: express.Response) => {
   const candidateDirs = [
     path.join(process.cwd(), 'uploads'),
     path.resolve('uploads'),
-    path.join(__dirname, 'uploads'),
+    path.join(currentDir, 'uploads'),
     'uploads',
     isStorageDisabled ? os.tmpdir() : 'uploads',
     os.tmpdir()
@@ -921,7 +922,7 @@ function buildDatasetCsv(): { sampleCount: number; csvPath: string } {
   const uploadDirs = [
     path.join(process.cwd(), 'uploads'),
     path.resolve('uploads'),
-    path.join(__dirname, 'uploads'),
+    path.join(currentDir, 'uploads'),
     'uploads',
     isStorageDisabled ? os.tmpdir() : 'uploads',
     os.tmpdir()
@@ -991,7 +992,7 @@ function buildDatasetCsv(): { sampleCount: number; csvPath: string } {
       const escapedTranscription = (t.meaning || "").replace(/"/g, '""');
       const escapedIntent = (t.category || "Phrase").replace(/"/g, '""');
       
-      csvContent.push(`"${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
+      csvContent.push(`"dataset/${newName}","${escapedTranscription}","${escapedPhonetic}","${escapedIntent}"`);
       sampleCount++;
     }
   }

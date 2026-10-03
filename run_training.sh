@@ -240,7 +240,17 @@ for col in ("transcription", "phonetic", "intent"):
 
 # Audio file existence check
 if "file_name" in df.columns:
-    missing = df["file_name"].apply(lambda p: not os.path.exists(str(p))).sum()
+    def check_audio_file(p):
+        if not p or not isinstance(p, str):
+            return False
+        s = str(p).strip()
+        return (
+            os.path.exists(s) or
+            os.path.exists(os.path.join("dataset", s)) or
+            os.path.exists(os.path.join("dataset", os.path.basename(s))) or
+            os.path.exists(os.path.join("uploads", os.path.basename(s)))
+        )
+    missing = df["file_name"].apply(lambda p: not check_audio_file(p)).sum()
     if missing:
         print(f"  ⚠️   Missing audio files : {missing}")
     else:

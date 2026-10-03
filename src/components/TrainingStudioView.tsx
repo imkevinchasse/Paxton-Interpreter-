@@ -458,23 +458,23 @@ export function TrainingStudioView() {
                 <div className="mb-4 p-4 bg-amber-950/70 border border-amber-600/50 rounded-xl font-sans text-xs text-amber-200 space-y-2">
                   <div className="font-bold flex items-center gap-2 text-amber-300">
                     <Info className="w-4 h-4 text-amber-400 shrink-0" />
-                    <span>Apple Silicon Mac: PyTorch &amp; Python Compatibility</span>
+                    <span>Apple Silicon Mac: Dependency &amp; Environment Auto-Repair</span>
                   </div>
                   <p className="text-amber-200/90 leading-relaxed font-sans">
-                    If your local Mac training failed during dependency setup (e.g. <code>torch==2.3.1</code> not found on Python 3.14), Apple Silicon prebuilt MPS GPU wheels are officially targeted at <strong>Python 3.11 and 3.12</strong>.
+                    If your training exited on <code>typing_extensions</code> or a broken virtualenv, <code>run_training.sh</code> now auto-injects compatibility shims and self-heals corrupted environments. To start completely fresh with your installed Python 3.11:
                   </p>
                   <div className="bg-black/50 p-2.5 rounded-lg border border-amber-500/30 flex items-center justify-between font-mono text-[11px] text-amber-300">
-                    <span>brew install python@3.11 &amp;&amp; rm -rf venv_train</span>
+                    <span>rm -rf venv_train &amp;&amp; ./run_training.sh</span>
                     <button
                       type="button"
                       onClick={() => {
-                        navigator.clipboard.writeText('brew install python@3.11 && rm -rf venv_train');
+                        navigator.clipboard.writeText('rm -rf venv_train && ./run_training.sh');
                         setCopiedLogs(true);
                         setTimeout(() => setCopiedLogs(false), 2000);
                       }}
                       className="ml-3 px-2 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded font-sans font-bold text-[10px] cursor-pointer"
                     >
-                      Copy Command
+                      Copy Clean Re-run
                     </button>
                   </div>
                 </div>

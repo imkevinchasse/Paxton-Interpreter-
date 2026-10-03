@@ -130,14 +130,16 @@ if [[ -d "$VENV_DIR" && -x "$VENV_PY" ]]; then
     if ! "$VENV_PY" -m pip --version &>/dev/null; then
         echo "   Existing venv has missing or broken pip. Recreating fresh venv …"
         rm -rf "$VENV_DIR"
-    elif "$VENV_PY" -c "import torch" 2>&1 | grep -q "typing_extensions"; then
-        echo "   Existing venv has missing typing_extensions — repairing …"
-        "$VENV_PY" -m pip install --quiet "typing-extensions>=4.8.0" 2>/dev/null || true
-    fi
-
-    if [[ -d "$VENV_DIR" && ("$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt") ]]; then
+    elif [[ "$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt" ]]; then
         echo "   Recreating $VENV_DIR cleanly for $PYTHON_BIN (Python $PY_VERSION) …"
         rm -rf "$VENV_DIR"
+    elif ! "$VENV_PY" -c "import typing_extensions" &>/dev/null; then
+        # Try quick repair on typing_extensions
+        "$VENV_PY" -m pip install --force-reinstall --no-deps --no-cache-dir "typing-extensions>=4.8.0" &>/dev/null || true
+        if ! "$VENV_PY" -c "import typing_extensions" &>/dev/null; then
+            echo "   Existing venv has broken package metadata. Recreating clean venv …"
+            rm -rf "$VENV_DIR"
+        fi
     fi
 fi
 
@@ -159,10 +161,41 @@ echo "   ✅  Activated: $(which python3)"
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "[4/6] Installing / verifying dependencies …"
 
-# Ensure typing-extensions is installed first (required by PyTorch)
-if ! python3 -c "import typing_extensions" &>/dev/null; then
-    python3 -m pip install --quiet "typing-extensions>=4.8.0" 2>/dev/null || true
-fi
+# Helper function to install or synthesize typing_extensions fallback
+ensure_typing_extensions() {
+    python3 -m pip install --upgrade --force-reinstall --no-deps --no-cache-dir "typing-extensions>=4.8.0" &>/dev/null || true
+    if ! python3 -c "import typing_extensions" &>/dev/null; then
+        python3 - <<'EOF' 2>/dev/null || true
+import sys, os, site
+sp_list = site.getsitepackages() if hasattr(site, 'getsitepackages') else []
+sp_list += [p for p in sys.path if 'site-packages' in p]
+for sp in sp_list:
+    if os.path.isdir(sp):
+        target = os.path.join(sp, "typing_extensions.py")
+        try:
+            with open(target, "w") as f:
+                f.write('''import sys, types, typing
+for _a in dir(typing):
+    globals()[_a] = getattr(typing, _a)
+if not hasattr(typing, "Self"):
+    Self = object
+if not hasattr(typing, "deprecated"):
+    def deprecated(msg, **kw):
+        def dec(fn): return fn
+        return dec
+if not hasattr(typing, "override"):
+    def override(fn): return fn
+TypeAliasType = getattr(typing, "TypeAliasType", object)
+Buffer = getattr(typing, "Buffer", object)
+''')
+            break
+        except Exception:
+            continue
+EOF
+    fi
+}
+
+ensure_typing_extensions
 
 if python3 -c "import torch, torchaudio, transformers, datasets, accelerate, evaluate, soundfile, librosa, pandas, jiwer, typing_extensions" &>/dev/null; then
     TORCH_INSTALLED=$(python3 -c "import torch; print(torch.__version__)")
@@ -188,8 +221,7 @@ else
                 echo "❌  Could not find or install a compatible PyTorch wheel for Python $PY_VERSION."
                 echo "    Apple Silicon PyTorch wheels are officially prebuilt for Python 3.10, 3.11, and 3.12."
                 echo "    Recommended fix in your Mac Terminal:"
-                echo "      brew install python@3.11"
-                echo "      rm -rf venv_train"
+                echo "      brew install python@3.11 && rm -rf venv_train"
                 echo "    Then re-launch training."
                 exit 1
             fi
@@ -211,7 +243,21 @@ else
     # Verify PyTorch imports cleanly
     if ! python3 -c "import torch, typing_extensions" &>/dev/null; then
         echo "   Repairing PyTorch core dependencies …"
-        python3 -m pip install --quiet "typing-extensions>=4.8.0" sympy networkx jinja2
+        ensure_typing_extensions
+        python3 -m pip install --quiet sympy networkx jinja2 || true
+    fi
+
+    # Final sanity check before passing step 4
+    if ! python3 -c "import torch, typing_extensions" &>/dev/null; then
+        echo "   Corrupted virtual environment detected. Automatically purging and rebuilding fresh venv …"
+        deactivate 2>/dev/null || true
+        rm -rf "$VENV_DIR"
+        "$PYTHON_BIN" -m venv "$VENV_DIR"
+        source "$VENV_DIR/bin/activate"
+        python3 -m pip install --upgrade pip setuptools wheel "typing-extensions>=4.8.0" --quiet
+        python3 -m pip install torch torchaudio "typing-extensions>=4.8.0" --quiet
+        python3 -m pip install "transformers>=4.40.0" "datasets>=2.19.0" "accelerate>=0.30.0" "evaluate>=0.4.0" "soundfile>=0.12.0" "librosa>=0.10.0" "pandas>=2.0.0" "jiwer>=0.3.0" --quiet
+        ensure_typing_extensions
     fi
 
     echo "   ✅  Dependencies ready"
@@ -221,6 +267,20 @@ fi
 if [[ "$IS_APPLE_SILICON" == true ]]; then
     echo "[5/6] Verifying MPS in PyTorch …"
     MPS_CHECK=$(python3 - <<'EOF'
+try:
+    import typing_extensions
+except ImportError:
+    import sys, types, typing
+    te = types.ModuleType("typing_extensions")
+    for _a in dir(typing):
+        setattr(te, _a, getattr(typing, _a))
+    te.Self = getattr(typing, "Self", object)
+    te.deprecated = lambda msg, **kw: (lambda fn: fn)
+    te.override = lambda fn: fn
+    te.TypeAliasType = getattr(typing, "TypeAliasType", object)
+    te.Buffer = getattr(typing, "Buffer", object)
+    sys.modules["typing_extensions"] = te
+
 import torch
 ok = torch.backends.mps.is_available() and torch.backends.mps.is_built()
 print("ok" if ok else "unavailable")

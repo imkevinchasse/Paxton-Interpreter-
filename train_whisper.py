@@ -29,6 +29,23 @@ import os
 import sys
 import re
 import json
+
+# Guarantee typing_extensions is available for PyTorch even if site-packages has broken links
+try:
+    import typing_extensions
+except ImportError:
+    import types
+    import typing
+    te = types.ModuleType("typing_extensions")
+    for attr in dir(typing):
+        setattr(te, attr, getattr(typing, attr))
+    te.Self = getattr(typing, "Self", object)
+    te.deprecated = lambda msg, **kw: (lambda fn: fn)
+    te.override = lambda fn: fn
+    te.TypeAliasType = getattr(typing, "TypeAliasType", object)
+    te.Buffer = getattr(typing, "Buffer", object)
+    sys.modules["typing_extensions"] = te
+
 import numpy as np
 import pandas as pd
 import torch

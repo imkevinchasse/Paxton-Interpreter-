@@ -33,8 +33,13 @@ import numpy as np
 import pandas as pd
 import torch
 import evaluate
+import soundfile as sf
+try:
+    import librosa
+except ImportError:
+    librosa = None
 from pathlib import Path
-from datasets import Dataset, Audio
+from datasets import Dataset
 from transformers import (
     WhisperFeatureExtractor,
     WhisperTokenizer,
@@ -89,6 +94,39 @@ def clean_transcript(text: str) -> str:
     text = re.sub(r" {2,}", " ", text)           # collapse runs of spaces
     text = re.sub(r"[^\x20-\x7E]", "", text)    # drop non-ASCII control chars
     return text
+
+# ─── Audio loader ─────────────────────────────────────────────────────────────
+
+def load_audio_array(audio_input):
+    """
+    Loads an audio file into a 1D float32 numpy array at 16000 Hz.
+    Directly avoids PyArrow cast_column issues and supports various audio formats.
+    """
+    if isinstance(audio_input, dict) and "array" in audio_input:
+        arr = audio_input["array"]
+        sr = audio_input.get("sampling_rate", 16000)
+    else:
+        file_path = str(audio_input).strip()
+        try:
+            arr, sr = sf.read(file_path, dtype="float32")
+        except Exception:
+            if librosa is not None:
+                arr, sr = librosa.load(file_path, sr=16000, mono=True)
+            else:
+                raise
+
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+
+    if sr != 16000:
+        if librosa is not None:
+            arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+        else:
+            from scipy.signal import resample
+            num_samples = int(len(arr) * 16000 / sr)
+            arr = resample(arr, num_samples)
+
+    return arr.astype(np.float32), 16000
 
 # ─── Audio augmentation ───────────────────────────────────────────────────────
 
@@ -258,13 +296,15 @@ def main():
     print(f"   {len(df)} usable samples")
 
     # ── Split ────────────────────────────────────────────────────────────────
-    # For 176 samples an 85/15 split gives slightly more training data
-    # than 80/20, while keeping enough eval samples to be meaningful.
-    val_size = max(10, int(len(df) * 0.15))
-    dataset  = Dataset.from_pandas(df[["file_name", "_label"]].rename(
-        columns={"_label": "transcription"}
-    ))
-    dataset = dataset.cast_column("file_name", Audio(sampling_rate=16000))
+    val_size = max(5, int(len(df) * 0.15))
+    if len(df) <= 10:
+        val_size = 1
+
+    # Load into Dataset using native Python dict to completely bypass PyArrow casting issues
+    dataset = Dataset.from_dict({
+        "file_name": [str(p) for p in df["file_name"].tolist()],
+        "transcription": [str(t) for t in df["_label"].tolist()]
+    })
     split   = dataset.train_test_split(test_size=val_size, seed=42)
     train_ds = split["train"]
     eval_ds  = split["test"]
@@ -285,9 +325,9 @@ def main():
     USE_AUG   = len(train_ds) < 500
 
     def prep_single(batch):
-        audio = batch["file_name"]
+        arr, sr = load_audio_array(batch["file_name"])
         batch["input_features"] = feature_extractor(
-            audio["array"], sampling_rate=audio["sampling_rate"]
+            arr, sampling_rate=sr
         ).input_features[0]
         batch["labels"] = tokenizer(batch["transcription"]).input_ids
         return batch
@@ -295,11 +335,11 @@ def main():
     def prep_augmented(examples):
         feats_out, labels_out = [], []
         for i in range(len(examples["file_name"])):
-            audio = examples["file_name"][i]
+            arr, sr = load_audio_array(examples["file_name"][i])
             ids   = tokenizer(examples["transcription"][i]).input_ids
-            for variant in augment_audio(audio["array"]):
+            for variant in augment_audio(arr):
                 feats_out.append(
-                    feature_extractor(variant, sampling_rate=audio["sampling_rate"]).input_features[0]
+                    feature_extractor(variant, sampling_rate=sr).input_features[0]
                 )
                 labels_out.append(ids)
         return {"input_features": feats_out, "labels": labels_out}

@@ -125,15 +125,29 @@ echo "[3/6] Setting up virtual environment …"
 VENV_PY="$VENV_DIR/bin/python3"
 if [[ -d "$VENV_DIR" && -x "$VENV_PY" ]]; then
     CURRENT_VENV_VER=$("$VENV_PY" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "corrupt")
+    
+    # Check if pip is functional in this existing virtual environment
+    if ! "$VENV_PY" -m pip --version &>/dev/null; then
+        echo "   Existing venv has missing or broken pip. Attempting ensurepip …"
+        if ! "$VENV_PY" -m ensurepip --upgrade &>/dev/null; then
+            echo "   ensurepip failed — marking venv as corrupt to auto-recreate cleanly."
+            CURRENT_VENV_VER="corrupt"
+        fi
+    fi
+
     if [[ "$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt" ]]; then
-        echo "   Recreating $VENV_DIR for $PYTHON_BIN (Python $PY_VERSION) …"
+        echo "   Recreating $VENV_DIR cleanly for $PYTHON_BIN (Python $PY_VERSION) …"
         rm -rf "$VENV_DIR"
     fi
 fi
 
 if [[ ! -d "$VENV_DIR" ]]; then
-    echo "   Creating $VENV_DIR …"
+    echo "   Creating fresh $VENV_DIR …"
     "$PYTHON_BIN" -m venv "$VENV_DIR"
+    # Ensure pip is present in newly created venv
+    if ! "$VENV_DIR/bin/python3" -m pip --version &>/dev/null; then
+        "$VENV_DIR/bin/python3" -m ensurepip --upgrade 2>/dev/null || true
+    fi
 else
     echo "   Found existing $VENV_DIR"
 fi
@@ -149,16 +163,22 @@ if python3 -c "import torch, torchaudio, transformers, datasets, accelerate, eva
     TORCH_INSTALLED=$(python3 -c "import torch; print(torch.__version__)")
     echo "   ✅  Dependencies already installed and functional (PyTorch $TORCH_INSTALLED)"
 else
+    # Bootstrap pip if missing in the environment
+    if ! python3 -m pip --version &>/dev/null; then
+        echo "   Bootstrapping pip in activated environment …"
+        python3 -m ensurepip --upgrade 2>/dev/null || true
+    fi
+
     echo "   Installing compatible wheels for Python $PY_VERSION …"
-    pip install --upgrade pip setuptools wheel --quiet || true
+    python3 -m pip install --upgrade pip setuptools wheel --quiet || true
 
     # Flexible PyTorch & Torchaudio installation (no rigid legacy ==2.3.1 pin)
     echo "   Installing PyTorch & Torchaudio …"
-    if ! pip install --quiet torch torchaudio; then
+    if ! python3 -m pip install --quiet torch torchaudio; then
         echo "   Retrying with flexible version bounds …"
-        if ! pip install --quiet "torch>=2.2.0" "torchaudio>=2.2.0"; then
+        if ! python3 -m pip install --quiet "torch>=2.2.0" "torchaudio>=2.2.0"; then
             echo "   Retrying with pre-release channel …"
-            if ! pip install --quiet --pre torch torchaudio; then
+            if ! python3 -m pip install --quiet --pre torch torchaudio; then
                 echo ""
                 echo "❌  Could not find or install a compatible PyTorch wheel for Python $PY_VERSION."
                 echo "    Apple Silicon PyTorch wheels are officially prebuilt for Python 3.10, 3.11, and 3.12."
@@ -172,7 +192,7 @@ else
     fi
 
     echo "   Installing Hugging Face & Audio libraries …"
-    pip install --quiet \
+    python3 -m pip install --quiet \
         "transformers>=4.40.0" \
         "datasets>=2.19.0" \
         "accelerate>=0.30.0" \

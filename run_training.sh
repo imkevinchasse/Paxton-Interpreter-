@@ -128,14 +128,14 @@ if [[ -d "$VENV_DIR" && -x "$VENV_PY" ]]; then
     
     # Check if pip is functional in this existing virtual environment
     if ! "$VENV_PY" -m pip --version &>/dev/null; then
-        echo "   Existing venv has missing or broken pip. Attempting ensurepip …"
-        if ! "$VENV_PY" -m ensurepip --upgrade &>/dev/null; then
-            echo "   ensurepip failed — marking venv as corrupt to auto-recreate cleanly."
-            CURRENT_VENV_VER="corrupt"
-        fi
+        echo "   Existing venv has missing or broken pip. Recreating fresh venv …"
+        rm -rf "$VENV_DIR"
+    elif "$VENV_PY" -c "import torch" 2>&1 | grep -q "typing_extensions"; then
+        echo "   Existing venv has missing typing_extensions — repairing …"
+        "$VENV_PY" -m pip install --quiet "typing-extensions>=4.8.0" 2>/dev/null || true
     fi
 
-    if [[ "$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt" ]]; then
+    if [[ -d "$VENV_DIR" && ("$CURRENT_VENV_VER" != "$PY_VERSION" || "$CURRENT_VENV_VER" == "corrupt") ]]; then
         echo "   Recreating $VENV_DIR cleanly for $PYTHON_BIN (Python $PY_VERSION) …"
         rm -rf "$VENV_DIR"
     fi
@@ -159,7 +159,12 @@ echo "   ✅  Activated: $(which python3)"
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "[4/6] Installing / verifying dependencies …"
 
-if python3 -c "import torch, torchaudio, transformers, datasets, accelerate, evaluate, soundfile, librosa, pandas, jiwer" &>/dev/null; then
+# Ensure typing-extensions is installed first (required by PyTorch)
+if ! python3 -c "import typing_extensions" &>/dev/null; then
+    python3 -m pip install --quiet "typing-extensions>=4.8.0" 2>/dev/null || true
+fi
+
+if python3 -c "import torch, torchaudio, transformers, datasets, accelerate, evaluate, soundfile, librosa, pandas, jiwer, typing_extensions" &>/dev/null; then
     TORCH_INSTALLED=$(python3 -c "import torch; print(torch.__version__)")
     echo "   ✅  Dependencies already installed and functional (PyTorch $TORCH_INSTALLED)"
 else
@@ -170,15 +175,15 @@ else
     fi
 
     echo "   Installing compatible wheels for Python $PY_VERSION …"
-    python3 -m pip install --upgrade pip setuptools wheel --quiet || true
+    python3 -m pip install --upgrade pip setuptools wheel "typing-extensions>=4.8.0" --quiet || true
 
     # Flexible PyTorch & Torchaudio installation (no rigid legacy ==2.3.1 pin)
     echo "   Installing PyTorch & Torchaudio …"
-    if ! python3 -m pip install --quiet torch torchaudio; then
+    if ! python3 -m pip install --quiet torch torchaudio "typing-extensions>=4.8.0"; then
         echo "   Retrying with flexible version bounds …"
-        if ! python3 -m pip install --quiet "torch>=2.2.0" "torchaudio>=2.2.0"; then
+        if ! python3 -m pip install --quiet "torch>=2.2.0" "torchaudio>=2.2.0" "typing-extensions>=4.8.0"; then
             echo "   Retrying with pre-release channel …"
-            if ! python3 -m pip install --quiet --pre torch torchaudio; then
+            if ! python3 -m pip install --quiet --pre torch torchaudio "typing-extensions>=4.8.0"; then
                 echo ""
                 echo "❌  Could not find or install a compatible PyTorch wheel for Python $PY_VERSION."
                 echo "    Apple Silicon PyTorch wheels are officially prebuilt for Python 3.10, 3.11, and 3.12."
@@ -193,6 +198,7 @@ else
 
     echo "   Installing Hugging Face & Audio libraries …"
     python3 -m pip install --quiet \
+        "typing-extensions>=4.8.0" \
         "transformers>=4.40.0" \
         "datasets>=2.19.0" \
         "accelerate>=0.30.0" \
@@ -201,6 +207,12 @@ else
         "librosa>=0.10.0" \
         "pandas>=2.0.0" \
         "jiwer>=0.3.0"
+
+    # Verify PyTorch imports cleanly
+    if ! python3 -c "import torch, typing_extensions" &>/dev/null; then
+        echo "   Repairing PyTorch core dependencies …"
+        python3 -m pip install --quiet "typing-extensions>=4.8.0" sympy networkx jinja2
+    fi
 
     echo "   ✅  Dependencies ready"
 fi

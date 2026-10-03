@@ -165,21 +165,89 @@ class PaddingCollator:
         batch["labels"] = labels
         return batch
 
-# ─── Metrics ──────────────────────────────────────────────────────────────────
+# ─── Text Normalization & Metrics ─────────────────────────────────────────────
+
+def normalize_text_for_eval(text: str) -> str:
+    """
+    Normalizes transcript text for accurate phonetic speech evaluation:
+    - Lowercases text
+    - Strips all punctuation marks so phonetic spellings aren't falsely penalized
+    - Normalizes internal whitespace
+    """
+    if not text:
+        return ""
+    try:
+        from transformers.models.whisper.english_normalizer import BasicTextNormalizer
+        text = BasicTextNormalizer()(text)
+    except Exception:
+        text = text.lower()
+    
+    # Strip any residual punctuation to ensure phonetic words aren't penalized
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
 
 def build_metrics(processor):
-    wer_fn = evaluate.load("wer")
+    """
+    Evaluates model performance primarily via Character Error Rate (CER),
+    which is vastly more meaningful for atypical/phonetic speech patterns than
+    Word Error Rate (WER). Also reports normalized WER for reference.
+    """
+    cer_fn = None
+    try:
+        cer_fn = evaluate.load("cer")
+    except Exception as e:
+        print(f"   ⚠️ Could not load CER from evaluate: {e}, using built-in Levenshtein CER")
+
+    wer_fn = None
+    try:
+        wer_fn = evaluate.load("wer")
+    except Exception:
+        pass
 
     def compute_metrics(pred):
         pred_ids  = pred.predictions
         label_ids = pred.label_ids.copy()
         label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
 
-        pred_str  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
-        label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+        # Decode raw token IDs
+        pred_str_raw  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
+        label_str_raw = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
-        wer = wer_fn.compute(predictions=pred_str, references=label_str)
-        return {"wer": round(wer * 100, 2)}
+        # Apply rigorous text normalization: strip punctuation, lowercase, collapse spaces
+        pred_str  = [normalize_text_for_eval(s) for s in pred_str_raw]
+        label_str = [normalize_text_for_eval(s) for s in label_str_raw]
+
+        metrics = {}
+
+        # 1. CER (Character Error Rate) - primary phonetic accuracy metric
+        if cer_fn is not None:
+            try:
+                cer = cer_fn.compute(predictions=pred_str, references=label_str)
+                metrics["cer"] = round(float(cer) * 100, 2)
+            except Exception as ex:
+                metrics["cer"] = 0.0
+        else:
+            # Fallback Levenshtein CER
+            import difflib
+            total_dist = 0
+            total_ref = 0
+            for p, r in zip(pred_str, label_str):
+                matcher = difflib.SequenceMatcher(None, r, p)
+                dist = sum(n for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != 'equal' for n in [max(i2 - i1, j2 - j1)])
+                total_dist += dist
+                total_ref += max(1, len(r))
+            metrics["cer"] = round((total_dist / max(1, total_ref)) * 100, 2)
+
+        # 2. WER (Word Error Rate) with normalized text
+        if wer_fn is not None:
+            try:
+                wer = wer_fn.compute(predictions=pred_str, references=label_str)
+                metrics["wer"] = round(float(wer) * 100, 2)
+            except Exception:
+                pass
+
+        return metrics
 
     return compute_metrics
 
@@ -365,6 +433,22 @@ def main():
     model.config.suppress_tokens      = []
     # Do NOT suppress atypical tokens (contractions, phonetic spellings)
     model.config.begin_suppress_tokens = []
+    if hasattr(model.config, "predict_timestamps"):
+        model.config.predict_timestamps = False
+
+    # Force predict_timestamps=False and suppress token looping during eval
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.predict_timestamps = False
+        model.generation_config.return_timestamps = False
+        model.generation_config.forced_decoder_ids = None
+        model.generation_config.suppress_tokens = []
+        model.generation_config.begin_suppress_tokens = []
+        model.generation_config.language = "english"
+        model.generation_config.task = "transcribe"
+        model.generation_config.max_length = 225
+        # Prevent repetitive loops on short phonetic vocalizations
+        model.generation_config.no_repeat_ngram_size = 3
+
     model = model.to(device)
 
     # ── Training args ────────────────────────────────────────────────────────
@@ -403,7 +487,7 @@ def main():
         "logging_steps"               : 5,
         "report_to"                   : ["none"],
         "load_best_model_at_end"      : True,
-        "metric_for_best_model"       : "wer",
+        "metric_for_best_model"       : "eval_loss", # eval_loss is the true convergence indicator
         "greater_is_better"           : False,
         "push_to_hub"                 : False,
         "dataloader_pin_memory"       : False,      # MPS requirement

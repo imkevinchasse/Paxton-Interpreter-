@@ -750,6 +750,7 @@ interface MetricPoint {
   step: number;
   trainLoss?: number;
   evalLoss?: number;
+  evalCer?: number;
   evalWer?: number;
   learningRate?: number;
   timestamp: string;
@@ -764,6 +765,9 @@ let trainingTelemetry: {
   totalSteps: number;
   trainLoss: number | null;
   evalLoss: number | null;
+  bestEvalLoss: number | null;
+  evalCer: number | null;
+  bestCer: number | null;
   evalWer: number | null;
   bestWer: number | null;
   history: MetricPoint[];
@@ -788,6 +792,9 @@ let trainingTelemetry: {
   totalSteps: 100,
   trainLoss: null,
   evalLoss: null,
+  bestEvalLoss: null,
+  evalCer: null,
+  bestCer: null,
   evalWer: null,
   bestWer: null,
   history: [],
@@ -871,26 +878,54 @@ function pushTrainingLog(rawLine: string) {
     });
   }
 
-  // Regex parse evaluation metrics: e.g. {'eval_loss': 0.42, 'eval_wer': 0.28, 'epoch': 1.0}
-  const evalMatch = line.match(/\{.*['"]eval_loss['"]\s*:\s*([0-9.]+).*['"]eval_wer['"]\s*:\s*([0-9.]+).*\}/);
-  if (evalMatch) {
-    const eLoss = parseFloat(evalMatch[1]);
-    const wer = parseFloat(evalMatch[2]);
-    trainingTelemetry.evalLoss = eLoss;
-    trainingTelemetry.evalWer = wer;
-    if (trainingTelemetry.bestWer === null || wer < trainingTelemetry.bestWer) {
-      trainingTelemetry.bestWer = wer;
+  // Regex parse evaluation metrics:
+  // e.g. {'eval_loss': 3.083, 'eval_cer': 42.1, 'eval_wer': 85.3, 'epoch': 2.0}
+  // or individual components logged by Hugging Face trainer
+  if (line.includes("'eval_loss'") || line.includes('"eval_loss"') || line.includes("eval_loss:") || line.includes("'eval_cer'") || line.includes('"eval_cer"')) {
+    const lossMatch = line.match(/['"]eval_loss['"]\s*:\s*([0-9.]+)/);
+    const cerMatch  = line.match(/['"](?:eval_)?cer['"]\s*:\s*([0-9.]+)/);
+    const werMatch  = line.match(/['"](?:eval_)?wer['"]\s*:\s*([0-9.]+)/);
+    const epochMatch = line.match(/['"]epoch['"]\s*:\s*([0-9.]+)/);
+
+    const eLoss = lossMatch ? parseFloat(lossMatch[1]) : undefined;
+    let cer = cerMatch ? parseFloat(cerMatch[1]) : undefined;
+    if (cer !== undefined && cer > 1.0) cer = cer / 100; // normalize percentage if > 1.0
+    let wer = werMatch ? parseFloat(werMatch[1]) : undefined;
+    if (wer !== undefined && wer > 1.0) wer = wer / 100;
+
+    if (eLoss !== undefined) {
+      trainingTelemetry.evalLoss = eLoss;
+      if (trainingTelemetry.bestEvalLoss === null || eLoss < trainingTelemetry.bestEvalLoss) {
+        trainingTelemetry.bestEvalLoss = eLoss;
+      }
+    }
+    if (cer !== undefined) {
+      trainingTelemetry.evalCer = cer;
+      if (trainingTelemetry.bestCer === null || cer < trainingTelemetry.bestCer) {
+        trainingTelemetry.bestCer = cer;
+      }
+    }
+    if (wer !== undefined) {
+      trainingTelemetry.evalWer = wer;
+      if (trainingTelemetry.bestWer === null || wer < trainingTelemetry.bestWer) {
+        trainingTelemetry.bestWer = wer;
+      }
     }
 
+    const curEpoch = epochMatch ? parseFloat(epochMatch[1]) : trainingTelemetry.currentEpoch;
+    trainingTelemetry.phase = `Validation · Loss: ${eLoss !== undefined ? eLoss.toFixed(4) : '--'}${cer !== undefined ? ` · CER: ${(cer * 100).toFixed(1)}%` : ''}`;
+
     const last = trainingTelemetry.history[trainingTelemetry.history.length - 1];
-    if (last) {
-      last.evalLoss = eLoss;
-      last.evalWer = wer;
+    if (last && Math.abs(last.epoch - curEpoch) < 0.2) {
+      if (eLoss !== undefined) last.evalLoss = eLoss;
+      if (cer !== undefined) last.evalCer = cer;
+      if (wer !== undefined) last.evalWer = wer;
     } else {
       trainingTelemetry.history.push({
-        epoch: trainingTelemetry.currentEpoch,
+        epoch: curEpoch,
         step: trainingTelemetry.history.length + 1,
         evalLoss: eLoss,
+        evalCer: cer,
         evalWer: wer,
         timestamp: new Date().toLocaleTimeString()
       });
@@ -1072,6 +1107,9 @@ app.post('/api/training/simulate', (req, res) => {
     totalSteps: epochs * 20,
     trainLoss: 0.95,
     evalLoss: 0.92,
+    bestEvalLoss: 0.92,
+    evalCer: 0.38,
+    bestCer: 0.38,
     evalWer: 0.52,
     bestWer: 0.52,
     history: [],
@@ -1125,11 +1163,19 @@ app.post('/api/training/simulate', (req, res) => {
         const jitter = (Math.random() - 0.5) * 0.03;
         const tLoss = Math.max(0.08, Number((baseLoss + jitter).toFixed(4)));
         const eLoss = Math.max(0.11, Number((baseLoss * 1.08 + jitter).toFixed(4)));
+        const cer = Math.max(0.04, Number((0.42 * Math.exp(-0.38 * curEp) + 0.05).toFixed(3)));
         const wer = Math.max(0.09, Number((0.55 * Math.exp(-0.32 * curEp) + 0.08).toFixed(3)));
 
         trainingTelemetry.trainLoss = tLoss;
         trainingTelemetry.evalLoss = eLoss;
+        trainingTelemetry.evalCer = cer;
         trainingTelemetry.evalWer = wer;
+        if (trainingTelemetry.bestEvalLoss === null || eLoss < trainingTelemetry.bestEvalLoss) {
+          trainingTelemetry.bestEvalLoss = eLoss;
+        }
+        if (trainingTelemetry.bestCer === null || cer < trainingTelemetry.bestCer) {
+          trainingTelemetry.bestCer = cer;
+        }
         if (trainingTelemetry.bestWer === null || wer < trainingTelemetry.bestWer) {
           trainingTelemetry.bestWer = wer;
         }
@@ -1139,6 +1185,7 @@ app.post('/api/training/simulate', (req, res) => {
           step: trainingTelemetry.currentStep,
           trainLoss: tLoss,
           evalLoss: eLoss,
+          evalCer: cer,
           evalWer: wer,
           learningRate: parseFloat(lr) * Math.cos((curEp / epochs) * (Math.PI / 2)),
           timestamp: new Date().toLocaleTimeString()
@@ -1146,20 +1193,22 @@ app.post('/api/training/simulate', (req, res) => {
         trainingTelemetry.history.push(point);
 
         pushTrainingLog(`{'loss': ${tLoss}, 'learning_rate': ${point.learningRate?.toExponential(2)}, 'epoch': ${curEp}.0}`);
-        pushTrainingLog(`{'eval_loss': ${eLoss}, 'eval_wer': ${(wer * 100).toFixed(1)}%, 'epoch': ${curEp}.0}  [Best WER: ${((trainingTelemetry.bestWer || wer) * 100).toFixed(1)}%]`);
-        trainingTelemetry.phase = `Epoch ${curEp}/${epochs} · Loss: ${tLoss} · WER: ${(wer * 100).toFixed(1)}%`;
+        pushTrainingLog(`{'eval_loss': ${eLoss}, 'eval_cer': ${(cer * 100).toFixed(1)}%, 'eval_wer': ${(wer * 100).toFixed(1)}%, 'epoch': ${curEp}.0}  [Best Loss: ${(trainingTelemetry.bestEvalLoss || eLoss).toFixed(4)} | Best CER: ${((trainingTelemetry.bestCer || cer) * 100).toFixed(1)}%]`);
+        trainingTelemetry.phase = `Epoch ${curEp}/${epochs} · Loss: ${eLoss.toFixed(4)} · CER: ${(cer * 100).toFixed(1)}%`;
       } else {
         // Complete
         clearInterval(simulationInterval);
         simulationInterval = null;
         trainingTelemetry.status = 'completed';
-        trainingTelemetry.phase = `Training Complete! Best WER: ${((trainingTelemetry.bestWer || 0.118) * 100).toFixed(1)}%`;
+        trainingTelemetry.phase = `Training Complete! Best Loss: ${(trainingTelemetry.bestEvalLoss || 0.12).toFixed(4)} · CER: ${((trainingTelemetry.bestCer || 0.052) * 100).toFixed(1)}%`;
         trainingTelemetry.endTime = Date.now();
         pushTrainingLog("============================================================");
         pushTrainingLog("  ✅ Training complete!");
-        pushTrainingLog("  Model Saved  → ./whisper-paxton-final/");
-        pushTrainingLog("  Manifest     → ./whisper-paxton-final/training_manifest.json");
-        pushTrainingLog(`  Best WER     → ${((trainingTelemetry.bestWer || 0.118) * 100).toFixed(1)}%`);
+        pushTrainingLog("  Model Saved    → ./whisper-paxton-final/");
+        pushTrainingLog("  Manifest       → ./whisper-paxton-final/training_manifest.json");
+        pushTrainingLog(`  Best Eval Loss → ${(trainingTelemetry.bestEvalLoss || 0.12).toFixed(4)}`);
+        pushTrainingLog(`  Best CER       → ${((trainingTelemetry.bestCer || 0.052) * 100).toFixed(1)}% (Character Error Rate)`);
+        pushTrainingLog(`  Best WER       → ${((trainingTelemetry.bestWer || 0.118) * 100).toFixed(1)}% (Word Error Rate)`);
         pushTrainingLog("============================================================");
       }
     }
@@ -1202,6 +1251,9 @@ app.post('/api/training/start', async (req, res) => {
       totalSteps: epochs * Math.max(1, Math.ceil(sampleCount / batchSize)),
       trainLoss: null,
       evalLoss: null,
+      bestEvalLoss: null,
+      evalCer: null,
+      bestCer: null,
       evalWer: null,
       bestWer: null,
       history: [],
@@ -1339,6 +1391,9 @@ app.post('/api/train-models', async (req, res) => {
       totalSteps: epochs * Math.max(1, Math.ceil(sampleCount / batchSize)),
       trainLoss: null,
       evalLoss: null,
+      bestEvalLoss: null,
+      evalCer: null,
+      bestCer: null,
       evalWer: null,
       bestWer: null,
       history: [],

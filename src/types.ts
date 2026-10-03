@@ -72,6 +72,7 @@ export interface TrainingMetricPoint {
   step: number;
   trainLoss?: number;
   evalLoss?: number;
+  evalCer?: number;
   evalWer?: number;
   learningRate?: number;
   timestamp: string;
@@ -86,6 +87,9 @@ export interface TrainingTelemetry {
   totalSteps: number;
   trainLoss: number | null;
   evalLoss: number | null;
+  bestEvalLoss: number | null;
+  evalCer: number | null;
+  bestCer: number | null;
   evalWer: number | null;
   bestWer: number | null;
   history: TrainingMetricPoint[];

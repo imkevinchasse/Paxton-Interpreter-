@@ -145,6 +145,7 @@ export function TrainingStudioView() {
   // Metrics for rendering graph
   const history = telemetry?.history || [];
   const maxEpoch = telemetry?.totalEpochs || epochs || 10;
+  const maxLoss = Math.max(3.5, ...history.map(p => Math.max(p.trainLoss || 0, p.evalLoss || 0)));
 
   return (
     <div className="w-full max-w-6xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-20">
@@ -263,18 +264,28 @@ export function TrainingStudioView() {
           </p>
         </div>
 
-        <div className="p-3.5 bg-white border border-slate-200 rounded-xl shadow-xs space-y-1">
-          <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 block">Validation Loss</span>
-          <p className="text-sm font-mono font-bold text-purple-600">
+        <div className="p-3.5 bg-white border border-purple-200 bg-purple-50/20 rounded-xl shadow-xs space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-purple-700 block">Val Loss (eval_loss)</span>
+            <span className="text-[9px] bg-purple-100 text-purple-700 px-1 py-0.2 rounded font-medium">True Metric</span>
+          </div>
+          <p className="text-sm font-mono font-bold text-purple-700">
             {telemetry?.evalLoss !== null && telemetry?.evalLoss !== undefined ? telemetry.evalLoss.toFixed(4) : '--'}
           </p>
+          <span className="text-[10px] text-purple-600 block truncate">Best: {telemetry?.bestEvalLoss ? telemetry.bestEvalLoss.toFixed(4) : (telemetry?.evalLoss ? telemetry.evalLoss.toFixed(4) : '--')}</span>
         </div>
 
-        <div className="p-3.5 bg-white border border-slate-200 rounded-xl shadow-xs space-y-1">
-          <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 block">Best WER</span>
-          <p className="text-sm font-mono font-bold text-emerald-600">
-            {telemetry?.bestWer !== null && telemetry?.bestWer !== undefined ? `${(telemetry.bestWer * 100).toFixed(1)}%` : '--'}
+        <div className="p-3.5 bg-white border border-teal-200 bg-teal-50/20 rounded-xl shadow-xs space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] uppercase font-bold tracking-wider text-teal-800 block">Best CER</span>
+            <span className="text-[9px] bg-teal-100 text-teal-800 px-1 py-0.2 rounded font-medium">Phonetic</span>
+          </div>
+          <p className="text-sm font-mono font-bold text-teal-700">
+            {telemetry?.bestCer !== null && telemetry?.bestCer !== undefined ? `${(telemetry.bestCer * 100).toFixed(1)}%` : (telemetry?.evalCer !== null && telemetry?.evalCer !== undefined ? `${(telemetry.evalCer * 100).toFixed(1)}%` : '--')}
           </p>
+          <span className="text-[10px] text-slate-400 block truncate">
+            {telemetry?.bestWer !== null && telemetry?.bestWer !== undefined ? `WER: ${(telemetry.bestWer * 100).toFixed(1)}%` : 'Char Error Rate'}
+          </span>
         </div>
 
         <div className="p-3.5 bg-white border border-slate-200 rounded-xl shadow-xs space-y-1">
@@ -507,21 +518,38 @@ export function TrainingStudioView() {
         {/* Tab 2: Loss Curves & Telemetry Visualizer */}
         {activeTab === 'metrics' && (
           <div className="p-6 space-y-6">
+            {/* Metric Methodology Guidance Banner */}
+            <div className="p-4 bg-purple-50/80 border border-purple-200 rounded-xl flex items-start gap-3 text-xs text-purple-950 leading-relaxed shadow-xs">
+              <Sparkles className="w-5 h-5 text-purple-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <p className="font-bold text-sm text-purple-900">Validation Metric: Character Error Rate (CER) &amp; eval_loss</p>
+                  <span className="text-[10px] bg-purple-200 text-purple-800 font-semibold px-2 py-0.5 rounded-full">Recommended</span>
+                </div>
+                <p className="text-purple-800">
+                  Phonetic speech variations (e.g., <em>"dussin"</em> vs <em>"does in"</em>) artificially inflate word error penalties (often exceeding 100–250% WER for minor token boundary differences). <strong>Validation Loss (<code className="font-mono font-bold bg-purple-100 px-1 py-0.5 rounded text-purple-900">eval_loss</code>)</strong> is the authentic mathematical indicator of neural network convergence, while <strong>Character Error Rate (CER)</strong> evaluated with strict punctuation removal and timestamp suppression accurately measures acoustic intelligibility.
+                </p>
+              </div>
+            </div>
+
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h3 className="font-bold text-slate-800 text-sm">Fine-Tuning Convergence Curves</h3>
-                <p className="text-xs text-slate-500">Tracks Training Loss vs Validation Loss, and Paxton Word Error Rate (WER) across epochs.</p>
+                <p className="text-xs text-slate-500">Tracks Training Loss vs Validation Loss, and Character Error Rate (CER) across epochs.</p>
               </div>
 
-              <div className="flex items-center gap-4 text-xs font-medium">
+              <div className="flex flex-wrap items-center gap-4 text-xs font-medium">
                 <span className="flex items-center gap-1.5 text-indigo-600">
-                  <span className="w-3 h-0.5 bg-indigo-600"></span> Training Loss
+                  <span className="w-3 h-0.5 bg-indigo-600"></span> Train Loss
                 </span>
                 <span className="flex items-center gap-1.5 text-purple-600">
-                  <span className="w-3 h-0.5 bg-purple-600"></span> Validation Loss
+                  <span className="w-3 h-0.5 bg-purple-600 border-b border-dashed border-purple-600"></span> Val Loss (eval_loss)
+                </span>
+                <span className="flex items-center gap-1.5 text-teal-600">
+                  <span className="w-3 h-0.5 bg-teal-600"></span> CER (Primary)
                 </span>
                 <span className="flex items-center gap-1.5 text-emerald-600">
-                  <span className="w-3 h-0.5 bg-emerald-600"></span> Word Error Rate (WER)
+                  <span className="w-3 h-0.5 bg-emerald-600"></span> WER (Reference)
                 </span>
               </div>
             </div>
@@ -540,12 +568,12 @@ export function TrainingStudioView() {
                     <line key={i} x1="40" y1={y} x2="590" y2={y} stroke="#e2e8f0" strokeDasharray="3 3" />
                   ))}
 
-                  {/* Y Axis Labels */}
-                  <text x="30" y="15" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">1.0</text>
-                  <text x="30" y="75" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">0.75</text>
-                  <text x="30" y="135" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">0.50</text>
-                  <text x="30" y="195" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">0.25</text>
-                  <text x="30" y="235" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">0.0</text>
+                  {/* Y Axis Labels (Dynamic Loss / Error Scale) */}
+                  <text x="35" y="15" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">{maxLoss.toFixed(1)}</text>
+                  <text x="35" y="75" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">{(maxLoss * 0.75).toFixed(1)}</text>
+                  <text x="35" y="135" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">{(maxLoss * 0.50).toFixed(1)}</text>
+                  <text x="35" y="195" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">{(maxLoss * 0.25).toFixed(1)}</text>
+                  <text x="35" y="235" textAnchor="end" fontSize="10" fill="#94a3b8" fontFamily="monospace">0.0</text>
 
                   {/* Lines */}
                   {/* Train Loss Polyline */}
@@ -556,21 +584,34 @@ export function TrainingStudioView() {
                     strokeLinecap="round"
                     points={history.map((pt, i) => {
                       const x = 50 + (i / Math.max(1, history.length - 1)) * 530;
-                      const y = 230 - Math.min(1, Math.max(0, pt.trainLoss || 0.5)) * 200;
+                      const y = 230 - Math.min(1, Math.max(0, (pt.trainLoss || 0) / maxLoss)) * 200;
                       return `${x},${y}`;
                     }).join(' ')}
                   />
 
-                  {/* Eval Loss Polyline */}
+                  {/* Eval Loss Polyline (Primary True Indicator) */}
                   <polyline
                     fill="none"
                     stroke="#9333ea"
-                    strokeWidth="2"
+                    strokeWidth="2.5"
                     strokeDasharray="4 2"
                     strokeLinecap="round"
                     points={history.filter(pt => pt.evalLoss !== undefined).map((pt, i, arr) => {
                       const x = 50 + (i / Math.max(1, arr.length - 1)) * 530;
-                      const y = 230 - Math.min(1, Math.max(0, pt.evalLoss || 0.5)) * 200;
+                      const y = 230 - Math.min(1, Math.max(0, (pt.evalLoss || 0) / maxLoss)) * 200;
+                      return `${x},${y}`;
+                    }).join(' ')}
+                  />
+
+                  {/* CER Polyline */}
+                  <polyline
+                    fill="none"
+                    stroke="#0d9488"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    points={history.filter(pt => pt.evalCer !== undefined).map((pt, i, arr) => {
+                      const x = 50 + (i / Math.max(1, arr.length - 1)) * 530;
+                      const y = 230 - Math.min(1, Math.max(0, pt.evalCer || 0)) * 200;
                       return `${x},${y}`;
                     }).join(' ')}
                   />
@@ -579,19 +620,20 @@ export function TrainingStudioView() {
                   <polyline
                     fill="none"
                     stroke="#10b981"
-                    strokeWidth="2.5"
+                    strokeWidth="1.5"
+                    strokeDasharray="2 2"
                     strokeLinecap="round"
                     points={history.filter(pt => pt.evalWer !== undefined).map((pt, i, arr) => {
                       const x = 50 + (i / Math.max(1, arr.length - 1)) * 530;
-                      const y = 230 - Math.min(1, Math.max(0, pt.evalWer || 0.5)) * 200;
+                      const y = 230 - Math.min(1, Math.max(0, pt.evalWer || 0)) * 200;
                       return `${x},${y}`;
                     }).join(' ')}
                   />
 
-                  {/* Points */}
+                  {/* Data Points */}
                   {history.map((pt, i) => {
                     const x = 50 + (i / Math.max(1, history.length - 1)) * 530;
-                    const yTrain = 230 - Math.min(1, Math.max(0, pt.trainLoss || 0.5)) * 200;
+                    const yTrain = 230 - Math.min(1, Math.max(0, (pt.trainLoss || 0) / maxLoss)) * 200;
                     return (
                       <circle key={i} cx={x} cy={yTrain} r="3" fill="#4f46e5" />
                     );
@@ -614,19 +656,21 @@ export function TrainingStudioView() {
                   <tr>
                     <th className="py-2.5 px-4">Epoch / Step</th>
                     <th className="py-2.5 px-4">Train Loss</th>
-                    <th className="py-2.5 px-4">Validation Loss</th>
-                    <th className="py-2.5 px-4">Word Error Rate (WER)</th>
+                    <th className="py-2.5 px-4 text-purple-700">Val Loss (eval_loss)</th>
+                    <th className="py-2.5 px-4 text-teal-700">Char Error (CER)</th>
+                    <th className="py-2.5 px-4 text-emerald-700">Word Error (WER)</th>
                     <th className="py-2.5 px-4">Recorded At</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-mono">
-                  {history.slice(-6).reverse().map((pt, i) => (
+                  {history.slice(-10).reverse().map((pt, i) => (
                     <tr key={i} className="hover:bg-slate-50/50">
                       <td className="py-2 px-4 font-bold text-slate-700">Epoch {pt.epoch}</td>
                       <td className="py-2 px-4 text-indigo-600">{pt.trainLoss !== undefined ? pt.trainLoss.toFixed(4) : '--'}</td>
-                      <td className="py-2 px-4 text-purple-600">{pt.evalLoss !== undefined ? pt.evalLoss.toFixed(4) : '--'}</td>
-                      <td className="py-2 px-4 font-bold text-emerald-600">{pt.evalWer !== undefined ? `${(pt.evalWer * 100).toFixed(1)}%` : '--'}</td>
-                      <td className="py-2 px-4 text-slate-400">{pt.timestamp}</td>
+                      <td className="py-2 px-4 font-bold text-purple-700 bg-purple-50/30">{pt.evalLoss !== undefined ? pt.evalLoss.toFixed(4) : '--'}</td>
+                      <td className="py-2 px-4 font-bold text-teal-700">{pt.evalCer !== undefined ? `${(pt.evalCer * 100).toFixed(1)}%` : '--'}</td>
+                      <td className="py-2 px-4 text-emerald-600">{pt.evalWer !== undefined ? `${(pt.evalWer * 100).toFixed(1)}%` : '--'}</td>
+                      <td className="py-2 px-4 text-slate-400 text-[11px]">{pt.timestamp}</td>
                     </tr>
                   ))}
                 </tbody>

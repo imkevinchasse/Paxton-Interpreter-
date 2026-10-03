@@ -397,13 +397,18 @@ def main():
 
     # ── Processor ────────────────────────────────────────────────────────────
     print(f"\n[2/5] Loading processor for {MODEL_NAME} …")
+    is_en_only = MODEL_NAME.endswith(".en")
     feature_extractor = WhisperFeatureExtractor.from_pretrained(MODEL_NAME)
-    tokenizer = WhisperTokenizer.from_pretrained(
-        MODEL_NAME, language="english", task="transcribe"
-    )
-    processor = WhisperProcessor.from_pretrained(
-        MODEL_NAME, language="english", task="transcribe"
-    )
+    if is_en_only:
+        tokenizer = WhisperTokenizer.from_pretrained(MODEL_NAME)
+        processor = WhisperProcessor.from_pretrained(MODEL_NAME)
+    else:
+        tokenizer = WhisperTokenizer.from_pretrained(
+            MODEL_NAME, language="english", task="transcribe"
+        )
+        processor = WhisperProcessor.from_pretrained(
+            MODEL_NAME, language="english", task="transcribe"
+        )
 
     # ── Preprocess ───────────────────────────────────────────────────────────
     base_cols = dataset.column_names
@@ -460,8 +465,18 @@ def main():
         model.generation_config.forced_decoder_ids = None
         model.generation_config.suppress_tokens = []
         model.generation_config.begin_suppress_tokens = []
-        model.generation_config.language = "english"
-        model.generation_config.task = "transcribe"
+
+        # English-only Whisper models (.en) do not have multilingual language tokens or lang_to_id
+        has_lang_to_id = getattr(model.generation_config, "lang_to_id", None) is not None
+        if (not is_en_only) and has_lang_to_id:
+            model.generation_config.language = "english"
+            model.generation_config.task = "transcribe"
+        else:
+            model.generation_config.language = None
+            model.generation_config.task = None
+            if not hasattr(model.generation_config, "lang_to_id") or model.generation_config.lang_to_id is None:
+                model.generation_config.lang_to_id = {}
+
         model.generation_config.max_length = 225
         # Prevent repetitive loops on short phonetic vocalizations
         model.generation_config.no_repeat_ngram_size = 3

@@ -372,61 +372,99 @@ def main():
     # M2 supports bfloat16 natively via MPS; this is more stable than fp16 on MPS
     use_bf16 = (not use_fp16) and device.type == "mps"
 
-    extra_eval_args = {}
-    try:
-        import inspect
-        sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
-        if "eval_strategy" in sig.parameters:
-            extra_eval_args["eval_strategy"] = "epoch"
-        else:
-            extra_eval_args["evaluation_strategy"] = "epoch"
-    except Exception:
-        extra_eval_args["evaluation_strategy"] = "epoch"
+    import inspect
+    sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    valid_params = set(sig.parameters.keys())
 
-    training_args = Seq2SeqTrainingArguments(
-        output_dir                  = OUTPUT_CHECKPOINTS,
-        per_device_train_batch_size = batch_size,
-        gradient_accumulation_steps = 2,          # effective batch = batch_size * 2
-        learning_rate               = lr,
-        lr_scheduler_type           = "cosine",   # smoother decay vs. linear
-        warmup_ratio                = 0.1,        # 10% of steps for warmup
-        num_train_epochs            = epochs,
-        gradient_checkpointing      = True,
-        fp16                        = use_fp16,
-        bf16                        = use_bf16,
-        save_strategy               = "epoch",
-        per_device_eval_batch_size  = batch_size,
-        predict_with_generate       = True,
-        generation_max_length       = 225,
-        logging_steps               = 5,
-        report_to                   = ["none"],
-        load_best_model_at_end      = True,
-        metric_for_best_model       = "wer",
-        greater_is_better           = False,
-        push_to_hub                 = False,
-        dataloader_pin_memory       = False,      # MPS requirement
-        optim                       = "adamw_torch",
-        save_total_limit            = 3,          # Keep only the 3 best checkpoints
-        **extra_eval_args
-    )
+    # Calculate steps for warmup fallback if warmup_ratio is not supported
+    effective_batch = max(1, batch_size * 2)
+    steps_per_epoch = max(1, len(train_ds) // effective_batch)
+    total_training_steps = max(1, steps_per_epoch * epochs)
+    calculated_warmup_steps = max(1, int(total_training_steps * 0.1))
+
+    desired_args = {
+        "output_dir"                  : OUTPUT_CHECKPOINTS,
+        "per_device_train_batch_size" : batch_size,
+        "gradient_accumulation_steps" : 2,          # effective batch = batch_size * 2
+        "learning_rate"               : lr,
+        "lr_scheduler_type"           : "cosine",   # smoother decay vs. linear
+        "warmup_ratio"                : 0.1,        # 10% of steps for warmup
+        "warmup_steps"                : calculated_warmup_steps,
+        "num_train_epochs"            : epochs,
+        "gradient_checkpointing"      : True,
+        "fp16"                        : use_fp16,
+        "bf16"                        : use_bf16,
+        "save_strategy"               : "epoch",
+        "eval_strategy"               : "epoch",
+        "evaluation_strategy"         : "epoch",
+        "per_device_eval_batch_size"  : batch_size,
+        "predict_with_generate"       : True,
+        "generation_max_length"       : 225,
+        "logging_steps"               : 5,
+        "report_to"                   : ["none"],
+        "load_best_model_at_end"      : True,
+        "metric_for_best_model"       : "wer",
+        "greater_is_better"           : False,
+        "push_to_hub"                 : False,
+        "dataloader_pin_memory"       : False,      # MPS requirement
+        "optim"                       : "adamw_torch",
+        "save_total_limit"            : 3,          # Keep only the 3 best checkpoints
+    }
+
+    # Retain only arguments recognized by the current transformers version
+    filtered_args = {k: v for k, v in desired_args.items() if k in valid_params}
+
+    # 1. Warmup: prefer warmup_ratio if available, otherwise fallback to warmup_steps
+    if "warmup_ratio" in filtered_args:
+        filtered_args.pop("warmup_steps", None)
+    elif "warmup_steps" in valid_params:
+        filtered_args["warmup_steps"] = calculated_warmup_steps
+
+    # 2. Evaluation strategy: newer transformers uses eval_strategy, older uses evaluation_strategy
+    if "eval_strategy" in valid_params:
+        filtered_args["eval_strategy"] = "epoch"
+        filtered_args.pop("evaluation_strategy", None)
+    elif "evaluation_strategy" in valid_params:
+        filtered_args["evaluation_strategy"] = "epoch"
+        filtered_args.pop("eval_strategy", None)
+
+    # 3. Ensure load_best_model_at_end has aligned eval/save strategies
+    eval_key = "eval_strategy" if "eval_strategy" in filtered_args else ("evaluation_strategy" if "evaluation_strategy" in filtered_args else None)
+    if not eval_key or "save_strategy" not in filtered_args:
+        filtered_args.pop("load_best_model_at_end", None)
+        filtered_args.pop("metric_for_best_model", None)
+        filtered_args.pop("greater_is_better", None)
+
+    training_args = Seq2SeqTrainingArguments(**filtered_args)
 
     collator = PaddingCollator(processor=processor)
     metrics  = build_metrics(processor)
 
-    trainer = Seq2SeqTrainer(
-        args            = training_args,
-        model           = model,
-        train_dataset   = train_ds,
-        eval_dataset    = eval_ds,
-        data_collator   = collator,
-        compute_metrics = metrics,
-        tokenizer       = processor.feature_extractor,
-        callbacks       = [
-            # Stop early if val WER doesn't improve for 5 epochs in a row.
-            # With early stopping, the 'epochs' ceiling is a safety cap, not a target.
-            EarlyStoppingCallback(early_stopping_patience=5)
-        ],
-    )
+    # Inspect Seq2SeqTrainer signature to safely pass tokenizer / processing_class & callbacks
+    trainer_sig = inspect.signature(Seq2SeqTrainer.__init__)
+    trainer_params = set(trainer_sig.parameters.keys())
+
+    trainer_kwargs = {
+        "args"            : training_args,
+        "model"           : model,
+        "train_dataset"   : train_ds,
+        "eval_dataset"    : eval_ds,
+        "data_collator"   : collator,
+        "compute_metrics" : metrics,
+    }
+
+    # Tokenizer / processing_class compatibility across transformers versions
+    if "processing_class" in trainer_params:
+        trainer_kwargs["processing_class"] = processor.feature_extractor
+    elif "tokenizer" in trainer_params:
+        trainer_kwargs["tokenizer"] = processor.feature_extractor
+
+    # Only include EarlyStoppingCallback if load_best_model_at_end is active
+    if filtered_args.get("load_best_model_at_end"):
+        trainer_kwargs["callbacks"] = [EarlyStoppingCallback(early_stopping_patience=5)]
+
+    filtered_trainer_kwargs = {k: v for k, v in trainer_kwargs.items() if k in trainer_params}
+    trainer = Seq2SeqTrainer(**filtered_trainer_kwargs)
 
     # ── Train ─────────────────────────────────────────────────────────────────
     print("\n[5/5] Training …")

@@ -19,7 +19,8 @@ import {
   X
 } from 'lucide-react';
 import { motion } from 'motion/react';
-import { type TrainingTelemetry, type TrainingMetricPoint } from '../types';
+import { type TrainingTelemetry, type TrainingMetricPoint, type VersioningState } from '../types';
+import { GitBranch, ShieldCheck } from 'lucide-react';
 
 export function TrainingStudioView() {
   const [telemetry, setTelemetry] = useState<TrainingTelemetry | null>(null);
@@ -34,8 +35,58 @@ export function TrainingStudioView() {
   const [datasetItems, setDatasetItems] = useState<any[]>([]);
   const [starting, setStarting] = useState<boolean>(false);
   const [studioError, setStudioError] = useState<string | null>(null);
+  const [finalizing, setFinalizing] = useState<boolean>(false);
+  const [finalizeMsg, setFinalizeMsg] = useState<string | null>(null);
+  const [versioningState, setVersioningState] = useState<VersioningState | null>(null);
+  const [versioningMsg, setVersioningMsg] = useState<string | null>(null);
 
   const consoleEndRef = useRef<HTMLDivElement>(null);
+
+  const fetchVersioning = async () => {
+    try {
+      const res = await fetch('/api/versions');
+      const data = await res.json();
+      setVersioningState(data);
+    } catch(e) {}
+  };
+
+  const handleMarkDatasetTrained = async () => {
+    try {
+      const res = await fetch('/api/versions/mark-trained', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setVersioningMsg('Marked active dataset as fine-tuned! Untrained delta reset.');
+        setTimeout(() => setVersioningMsg(null), 4000);
+        fetchVersioning();
+      }
+    } catch(e: any) {
+      alert('Error: ' + e.message);
+    }
+  };
+
+  const handleQuickSnapshotDataset = async () => {
+    try {
+      const count = (versioningState?.datasetVersions?.length || 0) + 1;
+      const res = await fetch('/api/versions/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'dataset',
+          versionTag: `v1.${count}`,
+          name: `Training Run Snapshot ${new Date().toLocaleDateString()}`,
+          description: `Captured before Whisper fine-tuning run with ${datasetItems.length} training pairs`
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setVersioningMsg(`Created dataset snapshot: ${data.version.versionTag}!`);
+        setTimeout(() => setVersioningMsg(null), 4000);
+        fetchVersioning();
+      }
+    } catch(e: any) {
+      alert('Error: ' + e.message);
+    }
+  };
 
   // Poll status & logs
   const fetchStatus = async () => {
@@ -56,6 +107,27 @@ export function TrainingStudioView() {
     } catch(e) {}
   };
 
+  const handleFinalizeModel = async () => {
+    setFinalizing(true);
+    setFinalizeMsg(null);
+    setStudioError(null);
+    try {
+      const res = await fetch('/api/training/finalize', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setFinalizeMsg(data.message || 'Model finalized and activated!');
+        fetchCheckpoints();
+        fetchStatus();
+      } else {
+        setStudioError(data.error || 'Failed to finalize model');
+      }
+    } catch(e: any) {
+      setStudioError(e.message || 'Failed to trigger finalization');
+    } finally {
+      setFinalizing(false);
+    }
+  };
+
   const fetchDataset = async () => {
     try {
       const res = await fetch('/api/training_data');
@@ -68,6 +140,7 @@ export function TrainingStudioView() {
     fetchStatus();
     fetchCheckpoints();
     fetchDataset();
+    fetchVersioning();
 
     const interval = setInterval(() => {
       fetchStatus();
@@ -238,6 +311,78 @@ export function TrainingStudioView() {
           >
             <X className="w-4 h-4" />
           </button>
+        </div>
+      )}
+
+      {/* Versioning Notification */}
+      {versioningMsg && (
+        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center justify-between text-xs text-emerald-800 shadow-xs">
+          <div className="flex items-center gap-2.5">
+            <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-medium">{versioningMsg}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setVersioningMsg(null)}
+            className="text-emerald-600 hover:text-emerald-800 p-1 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Dataset Versioning Safeguard Bar */}
+      {versioningState && (
+        <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-indigo-50 border border-indigo-100 rounded-xl text-indigo-600 shrink-0">
+              <GitBranch className="w-4 h-4" />
+            </div>
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 text-xs font-mono">
+                <span className="font-bold text-slate-800">
+                  Active Dataset: {versioningState.datasetVersions?.find(v => v.id === versioningState.activeDatasetVersionId)?.versionTag || 'v1.0'}
+                </span>
+                <span className="text-slate-400">·</span>
+                <span className="text-slate-600">
+                  {versioningState.datasetVersions?.find(v => v.id === versioningState.activeDatasetVersionId)?.name || 'Baseline Training Set'}
+                </span>
+                {versioningState.untrainedDatasetDeltaCount > 0 ? (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                    +{versioningState.untrainedDatasetDeltaCount} Untrained Pairs
+                  </span>
+                ) : (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                    ✓ All Pairs Fine-Tuned
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-500 font-mono">
+                {versioningState.untrainedDatasetDeltaCount > 0 
+                  ? 'New audio pairs have been added since last fine-tuning. Snapshot this version so you don\'t re-train on duplicates!'
+                  : 'All dataset pairs are accounted for in the active fine-tuned checkpoint.'}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={handleQuickSnapshotDataset}
+              className="px-3 py-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 rounded-xl text-xs font-mono font-medium text-slate-700 transition cursor-pointer flex items-center gap-1.5"
+            >
+              <GitBranch className="w-3.5 h-3.5 text-indigo-600" />
+              <span>Snapshot Dataset</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleMarkDatasetTrained}
+              className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-xl text-xs font-mono font-bold text-emerald-800 transition cursor-pointer flex items-center gap-1.5"
+            >
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+              <span>Mark Fine-Tuned</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -712,23 +857,37 @@ export function TrainingStudioView() {
             <div className="space-y-2">
               <h4 className="font-bold text-xs uppercase tracking-wider text-slate-500">Sample Dataset Records</h4>
               <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 border border-slate-200 rounded-xl">
-                {datasetItems.map((item, idx) => (
-                  <div key={item.id || idx} className="p-3 flex items-center justify-between hover:bg-slate-50 text-xs">
-                    <div className="space-y-0.5">
-                      <div className="font-bold text-slate-800">
-                        &ldquo;{item.sound}&rdquo; <span className="text-slate-400 font-normal">➔</span> &ldquo;{item.meaning}&rdquo;
+                {datasetItems.map((item, idx) => {
+                  const activeVer = versioningState?.datasetVersions?.find(v => v.id === versioningState.activeDatasetVersionId);
+                  const isNewlyAdded = activeVer && idx < (versioningState.untrainedDatasetDeltaCount || 0);
+
+                  return (
+                    <div key={item.id || idx} className="p-3 flex items-center justify-between hover:bg-slate-50 text-xs">
+                      <div className="space-y-0.5">
+                        <div className="font-bold text-slate-800 flex items-center gap-2">
+                          <span>&ldquo;{item.sound}&rdquo; <span className="text-slate-400 font-normal">➔</span> &ldquo;{item.meaning}&rdquo;</span>
+                          {isNewlyAdded ? (
+                            <span className="text-[9px] uppercase px-1.5 py-0.2 rounded font-mono font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                              New / Untrained
+                            </span>
+                          ) : (
+                            <span className="text-[9px] uppercase px-1.5 py-0.2 rounded font-mono font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                              {activeVer?.versionTag || 'v1.0'} Snapshot
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-400 font-mono">
+                          {item.filename || item.audioPath || 'sample_clip.wav'} · {item.category || 'Phrase'}
+                        </div>
                       </div>
-                      <div className="text-[11px] text-slate-400 font-mono">
-                        {item.filename || item.audioPath || 'sample_clip.wav'} · {item.category || 'Phrase'}
-                      </div>
+                      {item.hasAudio && (
+                        <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                          WAV Ready
+                        </span>
+                      )}
                     </div>
-                    {item.hasAudio && (
-                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                        WAV Ready
-                      </span>
-                    )}
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -737,9 +896,38 @@ export function TrainingStudioView() {
         {/* Tab 4: Checkpoints & Model Artifacts */}
         {activeTab === 'checkpoints' && (
           <div className="p-6 space-y-6">
-            <div>
-              <h3 className="font-bold text-slate-800 text-sm">Fine-Tuned Model Weights & Checkpoints</h3>
-              <p className="text-xs text-slate-500">Saved checkpoints and final fine-tuned Whisper model for Paxton.</p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="font-bold text-slate-800 text-sm">Fine-Tuned Model Weights &amp; Checkpoints</h3>
+                <p className="text-xs text-slate-500">Saved checkpoints and active fine-tuned Whisper model for Paxton.</p>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleFinalizeModel}
+                disabled={finalizing}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all shadow-xs cursor-pointer disabled:opacity-50"
+              >
+                <FolderCheck className="w-3.5 h-3.5" />
+                <span>{finalizing ? 'Finalizing Model …' : 'Finalize & Activate Best Model (Epoch 2)'}</span>
+              </button>
+            </div>
+
+            {finalizeMsg && (
+              <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 font-medium flex items-center gap-2">
+                <Check className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>{finalizeMsg}</span>
+              </div>
+            )}
+
+            <div className="p-4 bg-indigo-50/60 border border-indigo-100 rounded-xl text-xs text-indigo-900 space-y-1">
+              <span className="font-bold flex items-center gap-1.5 text-indigo-800">
+                <Sparkles className="w-3.5 h-3.5 text-indigo-600" />
+                Automatic Default Inference Activation
+              </span>
+              <p className="text-indigo-800/80 leading-relaxed">
+                When <code>whisper-paxton-final</code> or intermediate checkpoints exist, the Paxton Interpreter automatically routes all mic and audio inputs directly through your fine-tuned model via Apple Silicon MPS GPU acceleration.
+              </p>
             </div>
 
             <div className="space-y-3">

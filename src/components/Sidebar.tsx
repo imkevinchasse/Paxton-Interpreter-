@@ -1,5 +1,6 @@
 import { type Interaction, type ViewState } from '../types';
-import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart } from 'lucide-react';
+import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart, Sparkles, BookMarked, GitBranch } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
 
 interface SidebarProps { 
   interactions: Interaction[];
@@ -9,6 +10,23 @@ interface SidebarProps {
 }
 
 export function Sidebar({ interactions, currentView, onViewChange, onDelete }: SidebarProps) {
+  const [untrainedCount, setUntrainedCount] = useState<number>(0);
+
+  useEffect(() => {
+    const fetchUntrained = async () => {
+      try {
+        const res = await fetch('/api/versions');
+        const data = await res.json();
+        if (data && typeof data.untrainedDatasetDeltaCount === 'number') {
+          setUntrainedCount(data.untrainedDatasetDeltaCount);
+        }
+      } catch (e) {}
+    };
+    fetchUntrained();
+    const interval = setInterval(fetchUntrained, 6000);
+    return () => clearInterval(interval);
+  }, []);
+
   const speakText = (text: string) => {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
@@ -23,7 +41,7 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
         <h2 className="font-sans font-bold text-slate-800 text-sm uppercase tracking-wider mb-2 mt-2">Navigation</h2>
 
         
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col gap-1.5">
           <button 
             onClick={() => onViewChange('interpreter')}
             className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
@@ -32,7 +50,41 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'
             }`}
           >
-            <Activity className="w-4 h-4" /> Live Interpreter
+            <Activity className="w-4 h-4 text-indigo-600" /> Live Interpreter
+          </button>
+
+          <button 
+            onClick={() => onViewChange('cross_reference')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'cross_reference' 
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <BookA className="w-4 h-4 text-indigo-600" />
+              <span>Dictionary</span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
+              Phrases & Words
+            </span>
+          </button>
+
+          <button 
+            onClick={() => onViewChange('grammar_rulebook')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'grammar_rulebook' 
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <BookMarked className="w-4 h-4 text-indigo-600" />
+              <span>Grammar Rulebook</span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200">
+              Hypothesis
+            </span>
           </button>
 
           <button 
@@ -47,11 +99,34 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
               <LineChart className="w-4 h-4 text-indigo-600" />
               <span>Training Studio</span>
             </div>
-            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-              Live
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+              Whisper
             </span>
           </button>
           
+          <button 
+            onClick={() => onViewChange('versioning')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'versioning' 
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <GitBranch className="w-4 h-4 text-indigo-600" />
+              <span>Data Versioning</span>
+            </div>
+            {untrainedCount > 0 ? (
+              <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-300 animate-pulse">
+                +{untrainedCount} New
+              </span>
+            ) : (
+              <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+                Snapshots
+              </span>
+            )}
+          </button>
+
           <button 
             onClick={() => onViewChange('training')}
             className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
@@ -60,40 +135,29 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'
             }`}
           >
-            <Database className="w-4 h-4" /> Intended Words
+            <Database className="w-4 h-4 text-indigo-600" /> Intended Words
           </button>
 
           <button 
             onClick={() => onViewChange('audiobank')}
-            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
+            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
               currentView === 'audiobank' 
                 ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'
             }`}
           >
-            <FileAudio className="w-4 h-4" /> Audio Pipeline
-          </button>
-          
-          <button 
-            onClick={() => onViewChange('dictionary')}
-            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
-              currentView === 'dictionary' 
-                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
-                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
-            }`}
-          >
-            <BookA className="w-4 h-4" /> Dictionary
+            <FileAudio className="w-4 h-4 text-indigo-600" /> Audio Pipeline
           </button>
           
           <button 
             onClick={() => onViewChange('settings')}
-            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors ${
+            className={`flex items-center gap-3 p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
               currentView === 'settings' 
                 ? 'bg-indigo-100 text-indigo-700 border border-indigo-200' 
                 : 'text-slate-600 hover:bg-slate-100 border border-transparent'
             }`}
           >
-            <Settings className="w-4 h-4" /> Model Settings
+            <Settings className="w-4 h-4 text-slate-500" /> Model Settings
           </button>
         </div>
       </div>

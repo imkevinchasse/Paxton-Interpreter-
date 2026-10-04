@@ -6,7 +6,9 @@ import { SettingsView } from './components/SettingsView';
 import { TrainingStudio } from './components/TrainingStudio';
 import { TrainingStudioView } from './components/TrainingStudioView';
 import { AudioBankView } from './components/AudioBankView';
-import { DictionaryView } from './components/DictionaryView';
+import { CrossReferenceStudioView } from './components/CrossReferenceStudioView';
+import { GrammarRulebookView } from './components/GrammarRulebookView';
+import { VersioningView } from './components/VersioningView';
 import { type Interaction, type PipelineResult, type ViewState } from './types';
 
 export default function App() {
@@ -18,7 +20,7 @@ export default function App() {
   const [currentView, setCurrentView] = useState<ViewState>(() => {
     try {
       const hash = window.location.hash.replace('#', '') as ViewState;
-      const validViews: ViewState[] = ['interpreter', 'training_studio', 'training', 'audiobank', 'dictionary', 'settings'];
+      const validViews: ViewState[] = ['interpreter', 'training_studio', 'training', 'audiobank', 'dictionary', 'cross_reference', 'grammar_rulebook', 'versioning', 'settings'];
       if (hash && validViews.includes(hash)) return hash;
 
       const saved = localStorage.getItem('paxton_current_view') as ViewState | null;
@@ -43,7 +45,7 @@ export default function App() {
       .catch(console.error);
   }, []);
 
-  const handleProcess = async (blob: Blob | null) => {
+  const handleProcess = async (blob: Blob | null, textTranscript?: string) => {
     setProcessing(true);
     setResult(null);
 
@@ -53,6 +55,10 @@ export default function App() {
     } else {
       // Fallback tiny blob for API
       formData.append('audio', new Blob([''], { type: 'audio/webm' }), 'audio.webm'); 
+    }
+
+    if (textTranscript) {
+      formData.append('text', textTranscript);
     }
 
     try {
@@ -130,14 +136,32 @@ export default function App() {
              <div className="w-full flex-1 flex flex-col items-center justify-center">
                { !result && !processing && <Microphone onProcess={handleProcess} /> }
                { processing && <ProcessingView /> }
-               { result && result.mode === 'auto' && <HighConfidenceView result={result} onDone={(txt) => finalizeInteraction(txt, result.candidates[0].id)} /> }
-               { result && result.mode === 'choice' && <MediumConfidenceView result={result} onSelect={(id, txt) => finalizeInteraction(txt, id)} /> }
-               { result && result.mode === 'clarification' && <LowConfidenceView result={result} onSubmit={(txt) => finalizeInteraction(txt, null)} /> }
+               { result && (result.mode === 'clarification' || result.isLowCertainty || result.final_confidence < 0.78) && (
+                 <LowConfidenceView result={result} onSubmit={(txt) => finalizeInteraction(txt, null)} />
+               )}
+               { result && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'auto' && (
+                 <HighConfidenceView result={result} onDone={(txt) => finalizeInteraction(txt, result.candidates[0]?.id || 'A')} />
+               )}
+               { result && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'choice' && (
+                 <MediumConfidenceView result={result} onSelect={(id, txt) => finalizeInteraction(txt, id)} />
+               )}
              </div>
            )}
 
            {currentView === 'training_studio' && (
              <TrainingStudioView />
+           )}
+
+           {currentView === 'grammar_rulebook' && (
+             <GrammarRulebookView />
+           )}
+
+           {currentView === 'versioning' && (
+             <VersioningView />
+           )}
+
+           {(currentView === 'cross_reference' || currentView === 'dictionary') && (
+             <CrossReferenceStudioView />
            )}
 
            {currentView === 'training' && (
@@ -146,10 +170,6 @@ export default function App() {
 
            {currentView === 'audiobank' && (
              <AudioBankView />
-           )}
-
-           {currentView === 'dictionary' && (
-             <DictionaryView />
            )}
 
            {currentView === 'settings' && (

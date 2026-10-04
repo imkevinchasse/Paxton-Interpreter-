@@ -11,13 +11,28 @@ coverage/
 db.json
 training_data.json
 dictionary.json
+cross_reference.json
+grammar_rulebook.json
+dictionary_queue.json
+versions_data.json
+snapshots/
+key.pem
+cert.pem
 settings.json
 optimized_context.json
 audio_bank.json
 audio_bank/
 audio/
 uploads/
+recordings/
 dataset/
+logs/
+_protected_backups/
+*.wav
+*.mp3
+*.ogg
+*.webm
+*.m4a
 
 # Models, C++ code, and Training
 whisper/
@@ -28,3 +43,5 @@ whisper-paxton-*/
 whisper-paxton-checkpoints/
 whisper-paxton-final/
 training.log
+benchmark_results.json
+training_manifest.json

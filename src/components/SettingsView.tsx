@@ -8,6 +8,10 @@ export function SettingsView() {
     llamaModel: '',
     llamaInterpreterModel: '',
     llamaDictionaryModel: '',
+    gemmaModel: 'gemma2',
+    grammarHypothesisModel: 'gemma2',
+    hypothesisMinSupport: 2,
+    hypothesisMinConfidence: 0.70,
     whisperEndpoint: '',
     trainingEpochs: 10,
     trainingLR: '1e-5',
@@ -140,18 +144,49 @@ export function SettingsView() {
                   placeholder="llama3"
                 />
               </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-emerald-700 uppercase tracking-widest">
+                    Grammar Hypothesis Engine Model (Gemma)
+                  </label>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                    Reasoning AI
+                  </span>
+                </div>
+                <input 
+                  type="text" 
+                  list="gemma-models"
+                  value={settings.grammarHypothesisModel || settings.gemmaModel || 'gemma2'}
+                  onChange={e => setSettings({ ...settings, grammarHypothesisModel: e.target.value, gemmaModel: e.target.value })}
+                  className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 transition-all text-sm font-mono shadow-inner"
+                  placeholder="gemma2"
+                />
+                <datalist id="gemma-models">
+                  <option value="gemma2" />
+                  <option value="gemma:7b" />
+                  <option value="gemma2:9b" />
+                  <option value="gemma2:27b" />
+                  <option value="gemma:2b" />
+                  <option value="gemma3" />
+                  <option value="llama3" />
+                  <option value="gemini-3.8-flash" />
+                </datalist>
+                <p className="text-xs text-slate-400 mt-1">
+                  Model used to analyze abnormal patterns (e.g. why Paxton dropped &ldquo;d&rdquo; or said &ldquo;a hell&rdquo;), formulate linguistic hypotheses, and test across the corpus.
+                </p>
+              </div>
               
               <datalist id="ollama-models">
                 <option value="llama3" />
+                <option value="gemma2" />
+                <option value="gemma:7b" />
                 <option value="gemma:2b" />
                 <option value="gemma:4b" />
-                <option value="gemma:7b" />
                 <option value="phi3" />
                 <option value="mistral" />
                 <option value="qwen:1.8b" />
-                <option value="qwen:4b" />
                 <option value="llama3:instruct-q4" />
-                <option value="gemma:2b-instruct-q4" />
               </datalist>
               <p className="text-xs text-slate-400 mt-2">
                  Assign different models. e.g. A fast lightweight model for Interpreter and a larger smarter model for Dictionary Builder.

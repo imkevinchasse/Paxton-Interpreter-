@@ -7,6 +7,7 @@ import { TrainingStudio } from './components/TrainingStudio';
 import { TrainingStudioView } from './components/TrainingStudioView';
 import { AudioBankView } from './components/AudioBankView';
 import { CrossReferenceStudioView } from './components/CrossReferenceStudioView';
+import { DictionaryView } from './components/DictionaryView';
 import { GrammarRulebookView } from './components/GrammarRulebookView';
 import { VersioningView } from './components/VersioningView';
 import { type Interaction, type PipelineResult, type ViewState } from './types';
@@ -160,8 +161,13 @@ export default function App() {
              <VersioningView />
            )}
 
-           {(currentView === 'cross_reference' || currentView === 'dictionary') && (
+           {currentView === 'cross_reference' && (
              <CrossReferenceStudioView />
+           )}
+
+           {/* The live dictionary the interpreter reads. It had no route of its own, so it could not be edited. */}
+           {currentView === 'dictionary' && (
+             <DictionaryView />
            )}
 
            {currentView === 'training' && (

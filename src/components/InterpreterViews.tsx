@@ -310,7 +310,7 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
         {/* Phase 3: Grammar Rulebook Deep Search */}
         <div className="border border-slate-200 rounded-xl overflow-hidden bg-white">
           <button
-            onClick={() => togglePhase(3)}
+            onClick={() => togglePhase('3')}
             className="w-full px-3.5 py-2.5 flex items-center justify-between hover:bg-slate-50 text-left transition cursor-pointer"
           >
             <div className="flex items-center gap-2.5">
@@ -331,9 +331,9 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
                 </div>
               </div>
             </div>
-            {expandedPhase === 3 ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+            {expandedPhase === '3' ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
           </button>
-          {expandedPhase === 3 && (
+          {expandedPhase === '3' && (
             <div className="px-3.5 pb-3 pt-1 border-t border-slate-100 text-xs text-slate-600 space-y-2 bg-slate-50/40">
               <p className="font-mono text-[11px]">{phases.phase3.reasoning}</p>
               {phases.phase3.appliedRules.length > 0 ? (
@@ -361,7 +361,7 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
         {/* Phase 4: Prior Context & Dictionary Cross-Referencing */}
         <div className="border border-slate-200 rounded-xl overflow-hidden bg-white">
           <button
-            onClick={() => togglePhase(4)}
+            onClick={() => togglePhase('4')}
             className="w-full px-3.5 py-2.5 flex items-center justify-between hover:bg-slate-50 text-left transition cursor-pointer"
           >
             <div className="flex items-center gap-2.5">
@@ -384,9 +384,9 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
                 </div>
               </div>
             </div>
-            {expandedPhase === 4 ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+            {expandedPhase === '4' ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
           </button>
-          {expandedPhase === 4 && (
+          {expandedPhase === '4' && (
             <div className="px-3.5 pb-3 pt-1 border-t border-slate-100 text-xs text-slate-600 space-y-2 bg-slate-50/40">
               <div className="grid grid-cols-2 gap-2 text-[11px] font-mono">
                 <div className="p-2 bg-white rounded-lg border border-slate-200">
@@ -421,7 +421,7 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
         {/* Phase 5: Voice Model Output */}
         <div className="border border-slate-200 rounded-xl overflow-hidden bg-white">
           <button
-            onClick={() => togglePhase(5)}
+            onClick={() => togglePhase('5')}
             className="w-full px-3.5 py-2.5 flex items-center justify-between hover:bg-slate-50 text-left transition cursor-pointer"
           >
             <div className="flex items-center gap-2.5">
@@ -437,9 +437,9 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
                 </div>
               </div>
             </div>
-            {expandedPhase === 5 ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+            {expandedPhase === '5' ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
           </button>
-          {expandedPhase === 5 && (
+          {expandedPhase === '5' && (
             <div className="px-3.5 pb-3 pt-1 border-t border-slate-100 text-xs text-slate-600 space-y-2 bg-slate-50/40 font-mono flex items-center justify-between">
               <div>
                 <div className="text-slate-800 font-bold">&ldquo;{phases.phase5.spokenText}&rdquo;</div>

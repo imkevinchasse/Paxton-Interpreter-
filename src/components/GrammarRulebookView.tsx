@@ -44,13 +44,16 @@ export function GrammarRulebookView() {
 
   // New rule modal state
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
-  const [newRuleForm, setNewRuleForm] = useState({
+  const emptyRuleForm = {
     ruleName: '',
-    patternType: 'consonant_deletion',
+    patternType: 'custom',
     hypothesis: '',
     condition: '',
-    action: ''
-  });
+    action: '',
+    match: '',
+    replacement: ''
+  };
+  const [newRuleForm, setNewRuleForm] = useState(emptyRuleForm);
 
   const pollIntervalRef = useRef<any>(null);
 
@@ -120,7 +123,8 @@ export function GrammarRulebookView() {
   };
 
   const handleToggleRuleEnabled = async (rule: GrammarRule) => {
-    const updated = !rule.enabled;
+    // A missing flag means "on" everywhere else (badge, interpreter), so the first click must switch it off.
+    const updated = rule.enabled === false;
     try {
       await fetch(`/api/grammar-rules/${rule.id}`, {
         method: 'PUT',
@@ -176,6 +180,10 @@ export function GrammarRulebookView() {
   const handleCreateRule = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRuleForm.ruleName || !newRuleForm.hypothesis) return;
+    if (!!newRuleForm.match.trim() !== !!newRuleForm.replacement.trim()) {
+      alert('Fill in both "When Paxton says" and "Decode it as", or leave both empty.');
+      return;
+    }
 
     try {
       const res = await fetch('/api/grammar-rules', {
@@ -184,15 +192,13 @@ export function GrammarRulebookView() {
         body: JSON.stringify(newRuleForm)
       });
       const created = await res.json();
+      if (!res.ok || !created?.id) {
+        alert(created?.error || 'Could not save the rule.');
+        return;
+      }
       setRules(prev => [created, ...prev]);
       setShowAddModal(false);
-      setNewRuleForm({
-        ruleName: '',
-        patternType: 'consonant_deletion',
-        hypothesis: '',
-        condition: '',
-        action: ''
-      });
+      setNewRuleForm(emptyRuleForm);
     } catch (e) {
       console.error(e);
     }
@@ -785,6 +791,35 @@ export function GrammarRulebookView() {
                     placeholder="e.g. Omit 'a' in intent translation"
                     className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm"
                   />
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-indigo-100 bg-indigo-50/50 p-3 space-y-2">
+                <p className="text-xs text-slate-600">
+                  <span className="font-bold">Make it work offline (optional).</span> Without these two fields a custom rule only
+                  guides the language model; with them the interpreter swaps the word or phrase on its own.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-1">When Paxton says</label>
+                    <input
+                      type="text"
+                      value={newRuleForm.match}
+                      onChange={e => setNewRuleForm({ ...newRuleForm, match: e.target.value })}
+                      placeholder="e.g. spi-man"
+                      className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-slate-600 uppercase tracking-wider mb-1">Decode it as</label>
+                    <input
+                      type="text"
+                      value={newRuleForm.replacement}
+                      onChange={e => setNewRuleForm({ ...newRuleForm, replacement: e.target.value })}
+                      placeholder="e.g. Spiderman"
+                      className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm"
+                    />
+                  </div>
                 </div>
               </div>
 

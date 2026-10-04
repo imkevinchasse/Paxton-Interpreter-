@@ -73,31 +73,32 @@ export function DictionaryView() {
     if (!editingItem?.word || !editingItem?.definition) return;
     
     try {
-      if (editingItem.id) {
-         // It's an edit, but wait... do we have an edit endpoint? Let's assume we can POST to /api/dictionary to create, but we might need a PUT for edit.
-         // Let's implement an edit endpoint if not existing, or just delete and recreate.
-         await fetch(`/api/dictionary/${editingItem.id}`, { method: 'DELETE' });
-      }
-      
-      const res = await fetch('/api/dictionary', {
-        method: 'POST',
+      // Edits use the PUT route. The old delete-then-recreate approach lost the entry whenever the
+      // second request failed, and could drop its type and cross-reference link.
+      const isEdit = Boolean(editingItem.id);
+      const res = await fetch(isEdit ? `/api/dictionary/${editingItem.id}` : '/api/dictionary', {
+        method: isEdit ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-           word: editingItem.word, 
-           definition: editingItem.definition, 
-           context: editingItem.context || ''
+        body: JSON.stringify({
+          word: editingItem.word,
+          definition: editingItem.definition,
+          context: editingItem.context || '',
+          ...(editingItem.type ? { type: editingItem.type } : {})
         })
       });
       const data = await res.json();
-      
-      setDictionary(prev => {
-        const filtered = editingItem.id ? prev.filter(d => d.id !== editingItem.id) : prev;
-        return [data, ...filtered];
-      });
-      
+
+      if (!res.ok || !data?.id) {
+        alert(data?.error || 'Could not save the dictionary entry.');
+        return;
+      }
+
+      // Adding a word that already exists updates that entry on the server, so replace by id, not by position.
+      setDictionary(prev => [data, ...prev.filter(d => d.id !== data.id && d.id !== editingItem.id)]);
       setEditingItem(null);
     } catch (e) {
       console.error(e);
+      alert('Could not reach the server to save the entry.');
     }
   };
 

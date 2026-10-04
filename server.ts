@@ -8,6 +8,25 @@ import util from 'util';
 import { exec, spawn, execSync } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import {
+  alternativeMeanings,
+  applyGrammarRules,
+  buildLexicon,
+  builtinKeysForRule,
+  containsPhrase,
+  decodeUtterance,
+  escapeRegExp,
+  evaluatePattern,
+  evidenceCeiling,
+  fallbackConfidence,
+  findRelatedPairs,
+  isRuleActive,
+  lexKey,
+  polish,
+  primaryMeaning,
+  routeConfidence,
+  sanitizeCandidates
+} from './src/lib/decoder';
 
 let geminiAi: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
@@ -244,20 +263,23 @@ function seedBaselineDataIfEmpty() {
       ...s
     }));
     saveCrossReferenceData();
+  }
 
-    // Also ensure dictionaryData has baseline entries
-    if (dictionaryData.length === 0) {
-      crossReferenceData.forEach(c => {
+  // The dictionary is seeded on its own: it used to be filled only when cross-reference was also
+  // empty, so a missing/empty dictionary.json next to an existing cross_reference.json stayed empty.
+  if (dictionaryData.length === 0) {
+    crossReferenceData
+      .filter(c => c?.inDictionary === true && c?.approved !== false && lexKey(c?.phonetic) && c?.meaning)
+      .forEach(c => {
         dictionaryData.push({
           id: "dict_" + c.id,
           word: c.phonetic,
           definition: c.meaning,
-          context: c.context,
-          type: c.type
+          context: c.context || '',
+          type: c.type || (lexKey(c.phonetic).includes(' ') ? 'phrase' : 'word')
         });
       });
-      saveDictionaryData();
-    }
+    if (dictionaryData.length > 0) saveDictionaryData();
   }
 }
 
@@ -306,6 +328,105 @@ try {
 function saveDictionaryQueue() {
   if (isStorageDisabled) return;
   fs.writeFileSync('dictionary_queue.json', JSON.stringify(dictionaryQueue, null, 2));
+}
+
+// Items left in "analyzing" by a restart/crash would otherwise be stuck forever.
+for (const q of dictionaryQueue) {
+  if (q && q.status === 'analyzing') q.status = 'pending';
+}
+
+// -----------------------------------------------------
+// Dictionary <-> Cross-Reference helpers
+//
+// The dictionary is the source of truth the interpreter uses. Cross-reference items mirror it via
+// their `inDictionary` flag. Every change to one side must be reflected on the other, otherwise
+// deleted words keep translating and edited words keep their old meaning.
+// -----------------------------------------------------
+function entryTypeFor(word: string): 'word' | 'phrase' {
+  return lexKey(word).includes(' ') ? 'phrase' : 'word';
+}
+
+function findDictIndex(word: unknown): number {
+  const key = lexKey(word);
+  return key ? dictionaryData.findIndex(d => lexKey(d?.word) === key) : -1;
+}
+
+function findXrefIndex(phonetic: unknown): number {
+  const key = lexKey(phonetic);
+  return key ? crossReferenceData.findIndex(c => lexKey(c?.phonetic) === key) : -1;
+}
+
+/** Add or update a dictionary entry (matched by word, ignoring case/punctuation) and mirror it to cross-reference. */
+function upsertDictionaryEntry(input: { word: string; definition: string; context?: string; type?: string }) {
+  const word = input.word.trim();
+  const definition = input.definition.trim();
+  const type = input.type === 'word' || input.type === 'phrase' ? input.type : entryTypeFor(word);
+
+  let created = false;
+  let idx = findDictIndex(word);
+  if (idx >= 0) {
+    const e = dictionaryData[idx];
+    e.word = word;
+    e.definition = definition;
+    if (typeof input.context === 'string') e.context = input.context;
+    e.type = type;
+  } else {
+    created = true;
+    dictionaryData.unshift({
+      id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
+      word,
+      definition,
+      context: input.context || '',
+      type
+    });
+    idx = 0;
+  }
+
+  const x = findXrefIndex(word);
+  if (x >= 0) {
+    const c = crossReferenceData[x];
+    c.meaning = definition;
+    c.inDictionary = true;
+    c.approved = true;
+    c.type = type;
+    if (typeof input.context === 'string' && input.context) c.context = input.context;
+  }
+
+  return { entry: dictionaryData[idx], created };
+}
+
+/** Remove a dictionary entry and un-sync its cross-reference mirror so it stops translating. */
+function removeDictionaryEntry(word: unknown) {
+  const key = lexKey(word);
+  if (!key) return false;
+  const before = dictionaryData.length;
+  dictionaryData = dictionaryData.filter(d => lexKey(d?.word) !== key);
+  const x = findXrefIndex(word);
+  if (x >= 0) crossReferenceData[x].inDictionary = false;
+  return dictionaryData.length !== before;
+}
+
+/** LLMs asked for a JSON array usually return an object (Ollama's json mode forces one). Accept both. */
+function extractJsonArray(raw: string | null | undefined): any[] {
+  if (!raw) return [];
+  const text = raw.trim();
+  const tryParse = (s: string) => { try { return JSON.parse(s); } catch { return undefined; } };
+
+  let parsed = tryParse(text);
+  if (parsed === undefined) {
+    const arr = text.match(/\[[\s\S]*\]/);
+    if (arr) parsed = tryParse(arr[0]);
+  }
+  if (parsed === undefined) {
+    const obj = text.match(/\{[\s\S]*\}/);
+    if (obj) parsed = tryParse(obj[0]);
+  }
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === 'object') {
+    const inner = Object.values(parsed).find(v => Array.isArray(v));
+    return inner ? (inner as any[]) : [parsed];
+  }
+  return [];
 }
 
 let versioningState: any = {
@@ -412,32 +533,35 @@ async function deconstructPhraseWithLlm(originalSpoken: string, intendedMeaning:
   const spokenWords = originalSpoken.trim().split(/\s+/).filter(Boolean);
   const intendedWords = intendedMeaning.trim().split(/\s+/).filter(Boolean);
 
-  // Default algorithmic extraction fallback
+  // Offline fallback. Words are paired by position, which is only trustworthy when the spoken and
+  // intended phrases have the same number of words. (The old code paired by index regardless, so
+  // "mom gimme dat" -> "Mom, give me that" produced dat => "me", and dictionary entries that were
+  // really the whole sentence.) Unchanged words carry no information and are skipped.
+  const stripPunct = (s: string) => s.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  const aligned = spokenWords.length > 0 && spokenWords.length === intendedWords.length;
   const fallbackWords: any[] = [];
-  spokenWords.forEach((sw, idx) => {
-    const cleanSw = sw.toLowerCase().replace(/[^a-z0-9'-]/g, '');
-    const cleanIw = intendedWords[idx] ? intendedWords[idx].replace(/[^a-z0-9'-]/gi, '') : intendedMeaning;
-    if (cleanSw) {
-      fallbackWords.push({
-        phonetic: cleanSw,
-        meaning: cleanIw || intendedMeaning,
-        partOfSpeech: idx === 0 ? 'subject/verb' : 'word',
-        confidence: 0.90
-      });
-    }
-  });
-
-  // Extract 2-word connected n-grams
   const fallbackConnected: any[] = [];
-  for (let i = 0; i < spokenWords.length - 1; i++) {
-    const ngram = `${spokenWords[i]} ${spokenWords[i+1]}`.toLowerCase();
-    const intNgram = intendedWords[i] && intendedWords[i+1] ? `${intendedWords[i]} ${intendedWords[i+1]}` : intendedMeaning;
-    fallbackConnected.push({
-      phoneticNgram: ngram,
-      meaning: intNgram,
-      patternNote: 'Connected word co-occurrence'
+
+  if (aligned) {
+    spokenWords.forEach((sw, idx) => {
+      const cleanSw = stripPunct(sw).toLowerCase();
+      const cleanIw = stripPunct(intendedWords[idx]);
+      if (cleanSw && cleanIw && cleanSw !== cleanIw.toLowerCase()) {
+        fallbackWords.push({ phonetic: cleanSw, meaning: cleanIw, partOfSpeech: 'word', confidence: 0.75 });
+      }
     });
+
+    for (let i = 0; i < spokenWords.length - 1; i++) {
+      const spokenPair = [stripPunct(spokenWords[i]), stripPunct(spokenWords[i + 1])].join(' ').toLowerCase();
+      const intendedPair = [stripPunct(intendedWords[i]), stripPunct(intendedWords[i + 1])].join(' ');
+      if (spokenPair.trim() && spokenPair !== intendedPair.toLowerCase()) {
+        fallbackConnected.push({ phoneticNgram: spokenPair, meaning: intendedPair, patternNote: 'Connected word pair (positional match)' });
+      }
+    }
   }
+  const fallbackReasoning = aligned
+    ? 'Model unavailable: used 1:1 positional word alignment. Review each word before approving.'
+    : 'Model unavailable and the spoken/intended phrases have different word counts, so words cannot be aligned automatically. Only the whole phrase will be added; re-analyze when a model is online or add words manually.';
 
   const promptText = `You are an expert computational linguist specialized in atypical pediatric speech and AAC communication.
 Paxton uttered: "${originalSpoken}"
@@ -467,10 +591,22 @@ Output valid JSON only:
       if (match) cleanText = match[0];
       const parsed = JSON.parse(cleanText);
       if (parsed.deconstructedWords && Array.isArray(parsed.deconstructedWords)) {
+        const words = parsed.deconstructedWords
+          .filter((w: any) => w && typeof w.phonetic === 'string' && typeof w.meaning === 'string' && w.phonetic.trim() && w.meaning.trim())
+          .map((w: any) => ({
+            phonetic: w.phonetic.trim().toLowerCase(),
+            meaning: w.meaning.trim(),
+            partOfSpeech: typeof w.partOfSpeech === 'string' ? w.partOfSpeech : undefined,
+            confidence: typeof w.confidence === 'number' ? Math.min(1, Math.max(0, w.confidence)) : 0.85
+          }));
+        const connected = (Array.isArray(parsed.connectedWords) ? parsed.connectedWords : fallbackConnected)
+          .filter((c: any) => c && typeof c.phoneticNgram === 'string' && typeof c.meaning === 'string' && c.phoneticNgram.trim() && c.meaning.trim())
+          .map((c: any) => ({ ...c, phoneticNgram: c.phoneticNgram.trim().toLowerCase(), meaning: c.meaning.trim() }));
+        // Never let the model rewrite the pair the user actually gave us.
         return {
-          deconstructedWords: parsed.deconstructedWords,
-          connectedWords: Array.isArray(parsed.connectedWords) ? parsed.connectedWords : fallbackConnected,
-          wholePhrase: parsed.wholePhrase || { phonetic: originalSpoken, meaning: intendedMeaning },
+          deconstructedWords: words,
+          connectedWords: connected,
+          wholePhrase: { phonetic: originalSpoken, meaning: intendedMeaning },
           llmReasoning: parsed.llmReasoning || 'LLM linguistic breakdown completed.'
         };
       }
@@ -483,7 +619,7 @@ Output valid JSON only:
     deconstructedWords: fallbackWords,
     connectedWords: fallbackConnected,
     wholePhrase: { phonetic: originalSpoken, meaning: intendedMeaning },
-    llmReasoning: 'Algorithmic structural word and n-gram deconstruction completed.'
+    llmReasoning: fallbackReasoning
   };
 }
 
@@ -651,28 +787,83 @@ app.get('/api/dictionary', (req, res) => {
 
 app.delete('/api/dictionary/:id', (req, res) => {
   const id = req.params.id;
-  dictionaryData = dictionaryData.filter(d => d.id !== id);
-  saveDictionaryData();
+  const target = dictionaryData.find(d => d.id === id);
+  if (target) {
+    dictionaryData = dictionaryData.filter(d => d.id !== id);
+    // Only un-sync the cross-reference mirror if no other copy of this word remains.
+    if (findDictIndex(target.word) < 0) {
+      const x = findXrefIndex(target.word);
+      if (x >= 0) crossReferenceData[x].inDictionary = false;
+    }
+    saveDictionaryData();
+    saveCrossReferenceData();
+  }
   res.json({ success: true });
 });
 
 app.post('/api/dictionary', (req, res) => {
-  const item = {
-    id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
-    word: req.body.word,
-    definition: req.body.definition,
-    context: req.body.context
-  };
-  dictionaryData.unshift(item);
+  const word = typeof req.body?.word === 'string' ? req.body.word.trim() : '';
+  const definition = typeof req.body?.definition === 'string' ? req.body.definition.trim() : '';
+  if (!lexKey(word) || !definition) {
+    return res.status(400).json({ error: 'word and definition are required' });
+  }
+  const { entry } = upsertDictionaryEntry({
+    word,
+    definition,
+    context: typeof req.body?.context === 'string' ? req.body.context : undefined,
+    type: req.body?.type
+  });
   saveDictionaryData();
-  res.json(item);
+  saveCrossReferenceData();
+  res.json(entry);
+});
+
+app.put('/api/dictionary/:id', (req, res) => {
+  const entry = dictionaryData.find(d => d.id === req.params.id);
+  if (!entry) return res.status(404).json({ error: 'Dictionary entry not found' });
+
+  const word = typeof req.body?.word === 'string' ? req.body.word.trim() : entry.word;
+  const definition = typeof req.body?.definition === 'string' ? req.body.definition.trim() : entry.definition;
+  if (!lexKey(word) || !definition) {
+    return res.status(400).json({ error: 'word and definition are required' });
+  }
+
+  const clash = dictionaryData.find(d => d.id !== entry.id && lexKey(d.word) === lexKey(word));
+  if (clash) {
+    return res.status(409).json({ error: `"${clash.word}" already exists in the dictionary` });
+  }
+
+  // Renaming a word un-syncs the old cross-reference mirror, then the new word is mirrored.
+  if (lexKey(entry.word) !== lexKey(word)) {
+    const x = findXrefIndex(entry.word);
+    if (x >= 0) crossReferenceData[x].inDictionary = false;
+  }
+  entry.word = word;
+  entry.definition = definition;
+  if (typeof req.body?.context === 'string') entry.context = req.body.context;
+  entry.type = req.body?.type === 'word' || req.body?.type === 'phrase' ? req.body.type : entryTypeFor(word);
+
+  const x = findXrefIndex(word);
+  if (x >= 0) {
+    crossReferenceData[x].meaning = definition;
+    crossReferenceData[x].inDictionary = true;
+    crossReferenceData[x].approved = true;
+    crossReferenceData[x].type = entry.type;
+  }
+
+  saveDictionaryData();
+  saveCrossReferenceData();
+  res.json(entry);
 });
 
 let builderState = {
   isBuilding: false,
   totalItems: 0,
   processedItems: 0,
-  currentItem: ''
+  currentItem: '',
+  addedCount: 0,
+  failedCount: 0,
+  lastError: ''
 };
 
 app.get('/api/dictionary/build/status', (req, res) => {
@@ -703,26 +894,32 @@ app.post('/api/dictionary/build', async (req, res) => {
     return res.json({ success: false, message: 'No new items to process' });
   }
   
-  builderState.isBuilding = true;
-  builderState.totalItems = toProcess.length;
-  builderState.processedItems = 0;
+  builderState = {
+    isBuilding: true,
+    totalItems: toProcess.length,
+    processedItems: 0,
+    currentItem: '',
+    addedCount: 0,
+    failedCount: 0,
+    lastError: ''
+  };
   
   console.log(`\n[🔍 DICTIONARY BUILDER INITIATED] Processing ${toProcess.length} items`);
   res.status(202).json({ success: true, message: 'Dictionary build started in background' });
   
-  // Background processing
-  const ollamaUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
-  
-  for (const item of toProcess) {
-     builderState.currentItem = item.sound;
-     const promptText = `I am building a comprehensive phonetic dictionary to map raw, atypical speech sounds to standard English.
+  // Background processing. try/finally guarantees the builder never stays stuck on "in progress".
+  try {
+    for (const item of toProcess) {
+       builderState.currentItem = item.sound;
+       const promptText = `I am building a comprehensive phonetic dictionary to map raw, atypical speech sounds to standard English.
 The phonetic transcription (exact spoken words) is: "${item.sound}"
 The actual intended meaning (what was meant) is: "${item.meaning}"
 
 Analyze the pair word-by-word and phrase-by-phrase. Break down the entire sentence.
-Create entries for ALL words and multi-word phrases. You MUST map every part of the phonetic transcription to its intended meaning.
+Create entries for ALL words and multi-word phrases whose sound differs from the intended word. You MUST map every atypical part of the phonetic transcription to its intended meaning.
 Even if you have to infer or deduce the mapping based on context, provide your best mapping for every unique sound-to-meaning pair. 
-DO NOT SKIP ANY WORDS. If words must be grouped together to make sense (e.g. "nee hell" -> "need help"), group them.
+If words must be grouped together to make sense (e.g. "nee hell" -> "need help"), group them.
+Do not create an entry whose "word" and "definition" are identical.
 
 Output a JSON array of objects representing dictionary entries.
 Format MUST be exactly:
@@ -732,68 +929,67 @@ Format MUST be exactly:
 Example: [{"word": "wor", "definition": "word", "context": "i nee a wor"}, {"word": "nee hell", "definition": "need help", "context": "i nee hell"}]
 Return ONLY the raw JSON array, with no other text, markdown, or explanation.`;
 
-     let success = false;
-     try {
-       console.log(`--> Analyzing item for dictionary: "${item.sound}"`);
-       const llmRes = await fetch(`${ollamaUrl}/api/generate`, {
-         method: 'POST',
-         headers: { 'Content-Type': 'application/json' },
-         body: JSON.stringify({
-           model: appSettings.llamaDictionaryModel || 'llama3',
-           prompt: promptText,
-           stream: false,
-           format: 'json'
-         })
-       });
-       if (llmRes.ok) {
-         const data = await llmRes.json();
-         let parsed = [];
-         try {
-           let cleanText = data.response;
-           const jsonMatch = cleanText.match(/\[[\s\S]*\]/);
-           if (jsonMatch) cleanText = jsonMatch[0];
-           parsed = JSON.parse(cleanText);
-         } catch(err) {
-           console.log(`JSON parse error on LLM response. Skipping.`);
+       let success = false;
+       try {
+         console.log(`--> Analyzing item for dictionary: "${item.sound}"`);
+         // queryLlm gives us the request timeout and the Gemini fallback the raw fetch lacked.
+         const llmRaw = await queryLlm(promptText, appSettings.llamaDictionaryModel || 'llama3', true);
+         if (llmRaw === null) {
+           builderState.lastError = 'No language model reachable (Ollama is offline and no Gemini key is set).';
          }
-         
-         if (!Array.isArray(parsed)) parsed = [];
-         
+         const parsed = extractJsonArray(llmRaw);
+
          if (parsed.length > 0) {
            success = true;
            console.log(`    [+] Parsed ${parsed.length} entries`);
          }
 
-         for(const ent of parsed) {
-            // deduplicate checking by word
-            if (ent.word && ent.definition && !dictionaryData.find(d => d.word.toLowerCase() === ent.word.toLowerCase())) {
-               dictionaryData.unshift({
-                 id: Date.now().toString() + Math.random().toString(36).substring(2, 6),
-                 word: ent.word,
-                 definition: ent.definition,
-                 context: ent.context || item.sound
-               });
-               saveDictionaryData();
-               console.log(`    [+] Added dictionary word: "${ent.word}" => "${ent.definition}"`);
+         for (const ent of parsed) {
+            const word = typeof ent?.word === 'string' ? ent.word.trim() : '';
+            const definition = typeof ent?.definition === 'string' ? ent.definition.trim() : '';
+            if (!lexKey(word) || !definition || lexKey(word) === lexKey(definition)) continue;
+
+            const existing = dictionaryData[findDictIndex(word)];
+            if (existing) {
+              // Never silently overwrite an existing (possibly user-approved) meaning.
+              if (lexKey(existing.definition) !== lexKey(definition)) {
+                console.log(`    [!] Conflict kept as-is: "${word}" is "${existing.definition}", model suggested "${definition}"`);
+              }
+              continue;
             }
+            upsertDictionaryEntry({
+              word,
+              definition,
+              context: typeof ent.context === 'string' && ent.context ? ent.context : item.sound
+            });
+            builderState.addedCount++;
+            console.log(`    [+] Added dictionary word: "${word}" => "${definition}"`);
          }
+         saveDictionaryData();
+         saveCrossReferenceData();
+       } catch (e: any) {
+         builderState.lastError = e?.message || String(e);
+         console.log("Error analyzing for dictionary:", e);
        }
-     } catch (e) {
-       console.log("Error analyzing for dictionary:", e);
-     }
-     
-     if (success) {
-       item.source.dictProcessed = true;
-       if (item.type === 'training') saveTrainingData();
-       else saveDb();
-     }
-     
-     builderState.processedItems++;
+
+       if (success) {
+         item.source.dictProcessed = true;
+         if (item.type === 'training') saveTrainingData();
+         else saveDb();
+       } else {
+         builderState.failedCount++;
+       }
+
+       builderState.processedItems++;
+    }
+  } catch (fatal: any) {
+    builderState.lastError = fatal?.message || String(fatal);
+    console.error('[Dictionary Builder] Fatal error:', fatal);
+  } finally {
+    builderState.isBuilding = false;
+    builderState.currentItem = '';
+    console.log(`\n[✅ DICTIONARY BUILDER COMPLETE] Added ${builderState.addedCount}, failed ${builderState.failedCount}. Dictionary size: ${dictionaryData.length}`);
   }
-  
-  builderState.isBuilding = false;
-  builderState.currentItem = '';
-  console.log(`\n[✅ DICTIONARY BUILDER COMPLETE] Fetched/Updated entries: ${dictionaryData.length}`);
 });
 
 app.get('/api/training_data', (req, res) => {
@@ -887,78 +1083,56 @@ app.post('/api/dictionary/queue/:id/approve', (req, res) => {
   const { selectedWords, selectedConnected, includeWholePhrase } = req.body || {};
   let committedWords = 0;
   let committedConnected = 0;
+  let committedPhrase = 0;
+  const conflicts: { word: string; existing: string; proposed: string }[] = [];
 
-  // 1. Commit individual words
-  const wordsToCommit = Array.isArray(selectedWords) ? selectedWords : item.deconstructedWords;
-  for (const w of wordsToCommit || []) {
-    if (w.phonetic && w.meaning) {
-      if (!dictionaryData.find(d => d.word.toLowerCase() === w.phonetic.toLowerCase())) {
-        dictionaryData.unshift({
-          id: `dict_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          word: w.phonetic,
-          definition: w.meaning,
-          context: `Deconstructed from: "${item.originalSpoken}"`,
-          type: 'word'
-        });
-        committedWords++;
+  // Add to the dictionary (and its cross-reference mirror) unless the word already exists.
+  // An existing meaning is never overwritten silently; differences are reported back instead.
+  const commit = (word: string, meaning: string, type: 'word' | 'phrase', context: string, confidence: number): boolean => {
+    if (!lexKey(word) || !meaning || !String(meaning).trim()) return false;
+    const existing = dictionaryData[findDictIndex(word)];
+    if (existing) {
+      if (lexKey(existing.definition) !== lexKey(meaning)) {
+        conflicts.push({ word, existing: existing.definition, proposed: meaning });
       }
-      if (!crossReferenceData.find(c => c.phonetic.toLowerCase() === w.phonetic.toLowerCase())) {
-        crossReferenceData.unshift({
-          id: `cr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          phonetic: w.phonetic,
-          meaning: w.meaning,
-          type: 'word',
-          context: `Deconstructed word from: "${item.originalSpoken}"`,
-          confidence: w.confidence || 0.92,
-          occurrences: 1,
-          approved: true,
-          inDictionary: true
-        });
-      }
+      return false;
     }
-  }
-
-  // 2. Commit connected words / n-grams
-  const connectedToCommit = Array.isArray(selectedConnected) ? selectedConnected : item.connectedWords;
-  for (const c of connectedToCommit || []) {
-    if (c.phoneticNgram && c.meaning) {
-      if (!dictionaryData.find(d => d.word.toLowerCase() === c.phoneticNgram.toLowerCase())) {
-        dictionaryData.unshift({
-          id: `dict_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          word: c.phoneticNgram,
-          definition: c.meaning,
-          context: c.patternNote || `Connected words from "${item.originalSpoken}"`,
-          type: 'phrase'
-        });
-        committedConnected++;
-      }
-      if (!crossReferenceData.find(cr => cr.phonetic.toLowerCase() === c.phoneticNgram.toLowerCase())) {
-        crossReferenceData.unshift({
-          id: `cr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-          phonetic: c.phoneticNgram,
-          meaning: c.meaning,
-          type: 'phrase',
-          context: c.patternNote || 'Connected n-gram',
-          confidence: 0.90,
-          occurrences: 1,
-          approved: true,
-          inDictionary: true
-        });
-      }
-    }
-  }
-
-  // 3. Commit whole phrase if desired
-  if (includeWholePhrase !== false && item.wholePhrase?.phonetic) {
-    if (!dictionaryData.find(d => d.word.toLowerCase() === item.wholePhrase.phonetic.toLowerCase())) {
-      dictionaryData.unshift({
-        id: `dict_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        word: item.wholePhrase.phonetic,
-        definition: item.wholePhrase.meaning,
-        context: item.notes || `Full idiom: "${item.originalSpoken}"`,
-        type: 'phrase'
+    upsertDictionaryEntry({ word, definition: meaning, context, type });
+    const x = findXrefIndex(word);
+    if (x < 0) {
+      crossReferenceData.unshift({
+        id: `cr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        phonetic: lexKey(word),
+        meaning: String(meaning).trim(),
+        type,
+        context,
+        confidence,
+        occurrences: 1,
+        approved: true,
+        inDictionary: true
       });
     }
+    return true;
+  };
+
+  // 1. Individual words
+  const wordsToCommit = Array.isArray(selectedWords) ? selectedWords : item.deconstructedWords;
+  for (const w of wordsToCommit || []) {
+    if (commit(String(w?.phonetic ?? ''), String(w?.meaning ?? ''), 'word',
+        `Deconstructed from: "${item.originalSpoken}"`, w?.confidence || 0.92)) committedWords++;
+  }
+
+  // 2. Connected words / n-grams
+  const connectedToCommit = Array.isArray(selectedConnected) ? selectedConnected : item.connectedWords;
+  for (const c of connectedToCommit || []) {
+    if (commit(String(c?.phoneticNgram ?? ''), String(c?.meaning ?? ''), 'phrase',
+        c?.patternNote || `Connected words from "${item.originalSpoken}"`, 0.90)) committedConnected++;
+  }
+
+  // 3. Whole phrase (also mirrored to cross-reference now, like words and n-grams)
+  if (includeWholePhrase !== false && item.wholePhrase?.phonetic) {
+    if (commit(item.wholePhrase.phonetic, item.wholePhrase.meaning, 'phrase',
+        item.notes || `Full idiom: "${item.originalSpoken}"`, 0.95)) committedPhrase++;
   }
 
   saveDictionaryData();
@@ -967,9 +1141,14 @@ app.post('/api/dictionary/queue/:id/approve', (req, res) => {
   item.status = 'approved';
   saveDictionaryQueue();
 
+  const conflictNote = conflicts.length
+    ? ` ${conflicts.length} word(s) already had a different meaning and were left unchanged: ${conflicts.map(c => `"${c.word}" (kept "${c.existing}", not "${c.proposed}")`).join('; ')}.`
+    : '';
+
   res.json({
     success: true,
-    message: `Successfully approved! Committed ${committedWords} words and ${committedConnected} connected phrases to active Dictionary.`,
+    message: `Successfully approved! Committed ${committedWords} words, ${committedConnected} connected phrases and ${committedPhrase} whole phrase(s) to the active Dictionary.${conflictNote}`,
+    conflicts,
     item
   });
 });
@@ -1227,24 +1406,19 @@ Return ONLY raw JSON array.`;
     try {
       const rawRes = await queryLlm(chunkPrompt, appSettings.llamaDictionaryModel || 'llama3', true);
       if (rawRes) {
-        let clean = rawRes.trim();
-        const jsonMatch = clean.match(/\[[\s\S]*\]/);
-        if (jsonMatch) clean = jsonMatch[0];
-        const parsed = JSON.parse(clean);
+        const parsed = extractJsonArray(rawRes);
 
-        if (Array.isArray(parsed)) {
+        if (parsed.length > 0) {
           for (const item of parsed) {
-            if (item.phonetic && item.meaning) {
+            if (item?.phonetic && item?.meaning) {
               const phoneticClean = String(item.phonetic).trim().toLowerCase();
               const meaningClean = String(item.meaning).trim();
+              if (!lexKey(phoneticClean) || !meaningClean) continue;
 
-              const occurrences = trainingData.filter(t => 
-                (t.sound || '').toLowerCase().includes(phoneticClean)
-              ).length || 1;
+              // Count whole-word occurrences (substring counting made "a" appear everywhere).
+              const occurrences = trainingData.filter(t => containsPhrase(t.sound, phoneticClean)).length || 1;
 
-              const existingIdx = crossReferenceData.findIndex(c => 
-                c.phonetic.toLowerCase() === phoneticClean
-              );
+              const existingIdx = findXrefIndex(phoneticClean);
 
               if (existingIdx >= 0) {
                 crossReferenceData[existingIdx].occurrences = Math.max(crossReferenceData[existingIdx].occurrences, occurrences);
@@ -1260,7 +1434,7 @@ Return ONLY raw JSON array.`;
                   context: item.context || chunk[0].sound,
                   confidence: typeof item.confidence === 'number' ? item.confidence : 0.92,
                   occurrences,
-                  inDictionary: dictionaryData.some(d => d.word.toLowerCase() === phoneticClean),
+                  inDictionary: findDictIndex(phoneticClean) >= 0,
                   approved: true
                 });
                 newEntriesCount++;
@@ -1284,26 +1458,19 @@ app.post('/api/cross-reference/sync', (req, res) => {
   let synced = 0;
 
   for (const item of crossReferenceData) {
-    if (allApproved || (Array.isArray(ids) && ids.includes(item.id))) {
-      item.approved = true;
-      item.inDictionary = true;
+    if (!item?.phonetic || !item?.meaning) continue;
+    const selected = Array.isArray(ids) && ids.includes(item.id);
+    // "Sync all" must respect items the user explicitly rejected (approved === false).
+    const included = selected || (allApproved && item.approved !== false);
+    if (!included) continue;
 
-      const existing = dictionaryData.find(d => d.word.toLowerCase() === item.phonetic.toLowerCase());
-      if (!existing) {
-        dictionaryData.unshift({
-          id: "dict_" + item.id,
-          word: item.phonetic,
-          definition: item.meaning,
-          context: item.context,
-          type: item.type
-        });
-        synced++;
-      } else {
-        existing.definition = item.meaning;
-        existing.context = item.context || existing.context;
-        existing.type = item.type;
-      }
-    }
+    const { created } = upsertDictionaryEntry({
+      word: item.phonetic,
+      definition: item.meaning,
+      context: item.context,
+      type: item.type
+    });
+    if (created) synced++;
   }
 
   saveCrossReferenceData();
@@ -1314,17 +1481,24 @@ app.post('/api/cross-reference/sync', (req, res) => {
 
 app.post('/api/cross-reference', (req, res) => {
   const { phonetic, meaning, type, context } = req.body || {};
-  if (!phonetic || !meaning) {
+  if (typeof phonetic !== 'string' || typeof meaning !== 'string' || !lexKey(phonetic) || !meaning.trim()) {
     return res.status(400).json({ error: 'phonetic and meaning required' });
   }
 
-  const occurrences = trainingData.filter(t => (t.sound || '').toLowerCase().includes(phonetic.toLowerCase())).length || 1;
+  const duplicate = findXrefIndex(phonetic);
+  if (duplicate >= 0) {
+    return res.status(409).json({
+      error: `"${crossReferenceData[duplicate].phonetic}" is already cross-referenced. Edit the existing entry instead.`
+    });
+  }
+
+  const occurrences = trainingData.filter(t => containsPhrase(t.sound, phonetic)).length || 1;
   const newItem = {
     id: "xref_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
     phonetic: phonetic.trim().toLowerCase(),
     meaning: meaning.trim(),
-    type: type === 'word' ? 'word' : 'phrase',
-    context: context || '',
+    type: type === 'word' || type === 'phrase' ? type : entryTypeFor(phonetic),
+    context: typeof context === 'string' ? context : '',
     confidence: 0.95,
     occurrences,
     inDictionary: false,
@@ -1341,17 +1515,34 @@ app.put('/api/cross-reference/:id', (req, res) => {
   const item = crossReferenceData.find(c => c.id === id);
   if (!item) return res.status(404).json({ error: 'Item not found' });
 
-  Object.assign(item, req.body);
-  saveCrossReferenceData();
+  // Whitelist fields: the UI sends the whole object back (id, timestamps...) and Object.assign
+  // would let a request rewrite the id or inject arbitrary keys.
+  const b = req.body || {};
+  const previousPhonetic: string = item.phonetic;
+  const wasInDictionary = item.inDictionary === true;
+  if (typeof b.phonetic === 'string' && lexKey(b.phonetic)) item.phonetic = b.phonetic.trim().toLowerCase();
+  if (typeof b.meaning === 'string' && b.meaning.trim()) item.meaning = b.meaning.trim();
+  if (b.type === 'word' || b.type === 'phrase') item.type = b.type;
+  if (typeof b.context === 'string') item.context = b.context;
+  if (typeof b.notes === 'string') item.notes = b.notes;
+  if (typeof b.confidence === 'number' && isFinite(b.confidence)) item.confidence = Math.min(1, Math.max(0, b.confidence));
+  if (typeof b.approved === 'boolean') item.approved = b.approved;
+  if (typeof b.inDictionary === 'boolean') item.inDictionary = b.inDictionary;
+  if (item.approved === false) item.inDictionary = false; // a rejected item can't be live
 
-  if (item.inDictionary) {
-    const dItem = dictionaryData.find(d => d.word.toLowerCase() === item.phonetic.toLowerCase());
-    if (dItem) {
-      dItem.definition = item.meaning;
-      dItem.context = item.context;
-      saveDictionaryData();
-    }
+  // Make the dictionary follow the flag. Previously the toggle only flipped the flag, so
+  // "Add to Dictionary" added nothing and turning it off removed nothing.
+  if (wasInDictionary && lexKey(previousPhonetic) !== lexKey(item.phonetic)) {
+    removeDictionaryEntry(previousPhonetic); // renamed: the old spelling must stop translating
   }
+  if (item.inDictionary) {
+    upsertDictionaryEntry({ word: item.phonetic, definition: item.meaning, context: item.context, type: item.type });
+  } else {
+    removeDictionaryEntry(item.phonetic);
+    item.inDictionary = false;
+  }
+  saveDictionaryData();
+  saveCrossReferenceData();
 
   res.json(item);
 });
@@ -1364,27 +1555,21 @@ app.delete('/api/cross-reference/:id', (req, res) => {
 });
 
 app.post('/api/cross-reference/test-interpret', async (req, res) => {
-  const text = req.body?.text || '';
+  const text = String(req.body?.text || '').trim();
   if (!text) return res.json({ candidates: [], confidence: 0, matchedEntries: [] });
 
-  const textLower = text.toLowerCase().trim();
-  const matchedEntries: any[] = [];
-  const allKnown = [
-    ...crossReferenceData.map(c => ({ phonetic: c.phonetic, meaning: c.meaning, type: c.type })),
-    ...dictionaryData.map(d => ({ phonetic: d.word, meaning: d.definition, type: d.type || 'word' }))
-  ];
-
-  for (const k of allKnown) {
-    if (k.phonetic && textLower.includes(k.phonetic.toLowerCase())) {
-      if (!matchedEntries.find(m => m.phonetic.toLowerCase() === k.phonetic.toLowerCase())) {
-        matchedEntries.push(k);
-      }
-    }
-  }
+  // Same deterministic decode the live interpreter uses, so the tester can't disagree with it.
+  const decoded = decodeUtterance(text, {
+    lexicon: buildLexicon(dictionaryData, crossReferenceData),
+    rules: grammarRulebook
+  });
+  const matchedEntries = decoded.matchedEntries.map(e => ({ phonetic: e.word, meaning: e.definition, type: e.type || 'word' }));
 
   const promptText = `You are Paxton's communication interpreter.
 Paxton has unique speech patterns (drops consonants, merges words).
 What Whisper transcribed from his speech: "${text}"
+
+Draft from his verified dictionary and grammar rules: "${decoded.decoded}"
 
 Known Phonetic Mappings:
 ${JSON.stringify(matchedEntries)}
@@ -1392,18 +1577,18 @@ ${JSON.stringify(matchedEntries)}
 TASK:
 Deduce what Paxton actually MEANT to say.
 Translate the phonetic speech into a clean, natural English sentence.
+Report your honest confidence between 0 and 1.
 Output JSON:
 {
   "candidates": [
-    {"id": "A", "text": "Best decoded sentence of his intended meaning", "probability": 0.88},
-    {"id": "B", "text": "Alternative plausible phrasing", "probability": 0.08},
-    {"id": "C", "text": "Contextual alternative", "probability": 0.04}
+    {"id": "A", "text": "<best decoded sentence>", "probability": <number>},
+    {"id": "B", "text": "<alternative plausible phrasing>", "probability": <number>}
   ],
-  "confidence": 0.88
+  "confidence": <number>
 }`;
 
   let candidates: any[] = [];
-  let confidence = 0.85;
+  let confidence = 0;
 
   try {
     const rawRes = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true);
@@ -1413,24 +1598,19 @@ Output JSON:
       if (match) clean = match[0];
       const parsed = JSON.parse(clean);
       if (parsed && Array.isArray(parsed.candidates)) {
-        candidates = parsed.candidates;
-        confidence = parsed.confidence || 0.88;
+        candidates = sanitizeCandidates(parsed.candidates);
+        const reported = typeof parsed.confidence === 'number' ? parsed.confidence : (candidates[0]?.probability ?? 0);
+        confidence = Math.min(reported, evidenceCeiling(decoded.coverage));
       }
     }
   } catch(e) {}
 
   if (candidates.length === 0) {
-    let substituted = textLower;
-    for (const m of matchedEntries) {
-      const reg = new RegExp(`\\b${m.phonetic.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
-      substituted = substituted.replace(reg, m.meaning);
-    }
-    const capA = substituted.charAt(0).toUpperCase() + substituted.slice(1);
-    candidates = [
-      { id: 'A', text: capA, probability: 0.85 },
-      { id: 'B', text: capA.includes('need') ? capA.replace(/need/i, 'want') : (capA + ' please'), probability: 0.10 },
-      { id: 'C', text: text, probability: 0.05 }
-    ];
+    confidence = fallbackConfidence(decoded.coverage);
+    candidates = sanitizeCandidates([
+      { text: decoded.coverage > 0 ? decoded.decoded : polish(text), probability: confidence },
+      { text: polish(text), probability: 0.05 }
+    ]);
   }
 
   res.json({ candidates, confidence, matchedEntries });
@@ -1465,62 +1645,78 @@ function pushHypothesisLog(msg: string) {
   console.log(`[🧪 HYPOTHESIS ENGINE] ${msg}`);
 }
 
+// Explanatory text used when no language model is reachable. The rule's identity (name, type, key) always
+// comes from the pattern under test, never from the model, so a sloppy model reply cannot create junk rules.
+const HYPOTHESIS_TEMPLATES: Record<string, { hypothesis: string; condition: string; action: string; confidence: number }> = {
+  intrusive_a: {
+    hypothesis: "Paxton inserts 'a' as a rhythmic phonological placeholder between a verb/modal and a non-countable noun or predicate verb ('i nee a hell' -> 'I need help', 'go a sleep' -> 'go to sleep'). In contrast, before singular countable nouns ('a cookie', 'a ball'), 'a' is preserved as a standard determiner.",
+    condition: "Spoken token 'a' preceding an action verb or uncountable mass noun ('help', 'sleep', 'play', 'water')",
+    action: "Omit intrusive article 'a' or translate as partitive 'some' in target English",
+    confidence: 0.96
+  },
+  coda_deletion: {
+    hypothesis: "Paxton consistently drops terminal voiced alveolar plosives (/d/) and voiceless stops (/t/) on high-frequency monosyllabic content verbs ('nee' -> 'need', 'goo' -> 'good') due to oral-motor easing before following words.",
+    condition: "Spoken token 'nee' or word ending with elided alveolar stop where verb syntax requires 'need' or 'good'",
+    action: "Restore elided terminal stop ('nee' -> 'need', 'goo' -> 'good')",
+    confidence: 0.95
+  },
+  th_stopping: {
+    hypothesis: "Voiced interdental fricative /ð/ is systematically stopped to voiced alveolar plosive /d/ ('dis' for 'this', 'dat' for 'that'), and interrogative coda /t/ is deleted ('wa' for 'what').",
+    condition: "Spoken 'dis', 'dat', 'wa is dis'",
+    action: "Translate as standard demonstrative/interrogative 'this', 'that', 'what is this'",
+    confidence: 0.97
+  },
+  dussin: {
+    hypothesis: "Negative auxiliary verb 'doesn't' is articulated with central vowel laxing and elision of the coronal plosive coda /t/, producing the characteristic dissyllabic phonetic form 'dussin'.",
+    condition: "Spoken token 'dussin' preceding a base verb",
+    action: "Translate as 3rd person negative auxiliary 'doesn't'",
+    confidence: 0.95
+  },
+  baman: {
+    hypothesis: "Paxton deletes syllable-final unreleased coronal plosives (/t/) in medial consonant clusters of proper names, creating glottalized hyphenated compounds ('ba-man' for 'Batman', 'spi-man' for 'Spiderman').",
+    condition: "Phonetic pattern 'ba-man' or similar superhero/character compound",
+    action: "Reconstruct compound character entity 'Batman'",
+    confidence: 0.98
+  }
+};
+
+const HYPOTHESIS_PATTERNS: { key: string; name: string; patternType: string }[] = [
+  { key: 'intrusive_a', name: 'Intrusive Indefinite Article "a" before Mass Nouns & Actions', patternType: 'intrusive_article' },
+  { key: 'coda_deletion', name: 'Terminal Alveolar Plosive /d/ and /t/ Deletion (Coda Truncation)', patternType: 'consonant_deletion' },
+  { key: 'th_stopping', name: 'Interdental Fricative Stopping (/ð/ -> /d/ in demonstratives)', patternType: 'consonant_deletion' },
+  { key: 'dussin', name: 'Negative Auxiliary Contraction Reduction ("dussin" -> "doesn\'t")', patternType: 'word_merging' },
+  { key: 'baman', name: 'Medial Cluster Glottalization in Compound Entities ("ba-man" -> "Batman")', patternType: 'word_merging' }
+];
+
 async function runHypothesisCycle(): Promise<any> {
   if (trainingData.length === 0) {
     return { success: false, message: 'No training data available to test hypotheses.' };
   }
 
-  hypothesisCycleStatus.active = true;
-  hypothesisCycleStatus.cycleNumber++;
-  hypothesisCycleStatus.totalDatasetPairs = trainingData.length;
-  hypothesisCycleStatus.currentStep = 'scanning_dataset';
-  hypothesisCycleStatus.stepDescription = `Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning library of ${trainingData.length} phonetic speech pairs...`;
-  pushHypothesisLog(`Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning phonetic library (${trainingData.length} pairs)...`);
+  try {
+    hypothesisCycleStatus.active = true;
+    hypothesisCycleStatus.cycleNumber++;
+    hypothesisCycleStatus.totalDatasetPairs = trainingData.length;
+    hypothesisCycleStatus.currentStep = 'scanning_dataset';
+    hypothesisCycleStatus.stepDescription = `Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning library of ${trainingData.length} phonetic speech pairs...`;
+    pushHypothesisLog(`Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning phonetic library (${trainingData.length} pairs)...`);
 
-  const candidatePatterns = [
-    {
-      name: 'Intrusive Indefinite Article "a" before Mass Nouns & Actions',
-      patternType: 'intrusive_article',
-      detectCondition: (s: string) => /\b(nee|need|want|wan|go|went)\s+a\s+(hell|help|sleep|play|eat|drink|work)\b/i.test(s) || /\ba\s+(hell|help|sleep|play)\b/i.test(s)
-    },
-    {
-      name: 'Terminal Alveolar Plosive /d/ and /t/ Deletion (Coda Truncation)',
-      patternType: 'consonant_deletion',
-      detectCondition: (s: string) => /\b(nee|goo|wa|play|outsai)\b/i.test(s)
-    },
-    {
-      name: 'Interdental Fricative Stopping (/ð/ -> /d/ in demonstratives)',
-      patternType: 'consonant_deletion',
-      detectCondition: (s: string) => /\b(dis|dat)\b/i.test(s)
-    },
-    {
-      name: 'Negative Auxiliary Contraction Reduction ("dussin" -> "doesn\'t")',
-      patternType: 'word_merging',
-      detectCondition: (s: string) => /\bdussin\b/i.test(s)
-    },
-    {
-      name: 'Medial Cluster Glottalization in Compound Entities ("ba-man" -> "Batman")',
-      patternType: 'word_merging',
-      detectCondition: (s: string) => /\b(ba-man|spi-man)\b/i.test(s)
-    }
-  ];
+    const target = HYPOTHESIS_PATTERNS[(hypothesisCycleStatus.cycleNumber - 1) % HYPOTHESIS_PATTERNS.length];
+    const template = HYPOTHESIS_TEMPLATES[target.key];
 
-  const patternIndex = (hypothesisCycleStatus.cycleNumber - 1) % candidatePatterns.length;
-  const targetPatternDef = candidatePatterns[patternIndex];
+    hypothesisCycleStatus.currentStep = 'isolating_pattern';
+    hypothesisCycleStatus.activePattern = target.name;
+    hypothesisCycleStatus.stepDescription = `Step 2: Isolated abnormal pattern "${target.name}"`;
+    pushHypothesisLog(`Step 2: Isolated abnormal pattern: "${target.name}"`);
 
-  hypothesisCycleStatus.currentStep = 'isolating_pattern';
-  hypothesisCycleStatus.activePattern = targetPatternDef.name;
-  hypothesisCycleStatus.stepDescription = `Step 2: Isolated abnormal pattern "${targetPatternDef.name}"`;
-  pushHypothesisLog(`Step 2: Isolated abnormal pattern: "${targetPatternDef.name}"`);
+    // Step 3: model reasoning (explanatory text only)
+    const targetModel = appSettings.grammarHypothesisModel || appSettings.gemmaModel || 'gemma2';
+    hypothesisCycleStatus.currentStep = 'formulating_hypothesis';
+    hypothesisCycleStatus.stepDescription = `Step 3: Reasoning with ${targetModel} on why pattern occurs...`;
+    pushHypothesisLog(`Step 3: Formulating hypothesis with ${targetModel}...`);
 
-  // Step 3: Gemma reasoning prompt
-  const targetModel = appSettings.grammarHypothesisModel || appSettings.gemmaModel || 'gemma2';
-  hypothesisCycleStatus.currentStep = 'formulating_hypothesis';
-  hypothesisCycleStatus.stepDescription = `Step 3: Reasoning with ${targetModel} on why pattern occurs...`;
-  pushHypothesisLog(`Step 3: Formulating hypothesis with ${targetModel}...`);
-
-  const gemmaPrompt = `You are a clinical speech-language pathologist and phonologist studying speech variations in a child named Paxton.
-Observed Speech Phenomenon: "${targetPatternDef.name}"
+    const gemmaPrompt = `You are a clinical speech-language pathologist and phonologist studying speech variations in a child named Paxton.
+Observed Speech Phenomenon: "${target.name}"
 Paxton Training Pairs:
 ${trainingData.slice(0, 10).map((t, idx) => `${idx + 1}. Spoken: "${t.sound}" -> Intended: "${t.meaning}"`).join('\n')}
 
@@ -1531,199 +1727,120 @@ INSTRUCTIONS:
 
 Output JSON:
 {
-  "ruleName": "${targetPatternDef.name}",
-  "patternType": "${targetPatternDef.patternType}",
   "hypothesis": "Linguistic reasoning explaining the physiological/phonological cause of the pattern",
   "condition": "Explicit phonetic trigger condition",
   "action": "Transformation rule for the intent translator",
   "confidence": 0.95
 }`;
 
-  let candidateRule: any = null;
-  try {
-    const rawRes = await queryLlm(gemmaPrompt, targetModel, true);
-    if (rawRes) {
-      let clean = rawRes.trim();
-      const match = clean.match(/\{[\s\S]*\}/);
-      if (match) clean = match[0];
-      candidateRule = JSON.parse(clean);
-    }
-  } catch(e) {}
-
-  if (!candidateRule || !candidateRule.hypothesis) {
-    if (targetPatternDef.patternType === 'intrusive_article') {
-      candidateRule = {
-        ruleName: "Intrusive Article 'a' Omission before Mass Nouns & Actions",
-        patternType: "intrusive_article",
-        hypothesis: "Paxton inserts 'a' as a rhythmic phonological placeholder between a verb/modal and a non-countable noun or predicate verb ('i nee a hell' -> 'I need help', 'go a sleep' -> 'go to sleep'). In contrast, before singular countable nouns ('a cookie', 'a ball'), 'a' is preserved as a standard determiner.",
-        condition: "Spoken token 'a' preceding an action verb or uncountable mass noun ('help', 'sleep', 'play', 'water')",
-        action: "Omit intrusive article 'a' or translate as partitive 'some' in target English",
-        confidence: 0.96
-      };
-    } else if (targetPatternDef.name.includes('Alveolar')) {
-      candidateRule = {
-        ruleName: "Terminal /d/ & /t/ Alveolar Plosive Deletion (Coda Truncation)",
-        patternType: "consonant_deletion",
-        hypothesis: "Paxton consistently drops terminal voiced alveolar plosives (/d/) and voiceless stops (/t/) on high-frequency monosyllabic content verbs ('nee' -> 'need', 'goo' -> 'good') due to oral-motor easing before following words.",
-        condition: "Spoken token 'nee' or word ending with elided alveolar stop where verb syntax requires 'need' or 'good'",
-        action: "Restore elided terminal stop ('nee' -> 'need', 'goo' -> 'good')",
-        confidence: 0.95
-      };
-    } else if (targetPatternDef.name.includes('Interdental')) {
-      candidateRule = {
-        ruleName: "Interdental Fricative Stopping ('dis / dat' -> 'this / that')",
-        patternType: "consonant_deletion",
-        hypothesis: "Voiced interdental fricative /ð/ is systematically stopped to voiced alveolar plosive /d/ ('dis' for 'this', 'dat' for 'that'), and interrogative coda /t/ is deleted ('wa' for 'what').",
-        condition: "Spoken 'dis', 'dat', 'wa is dis'",
-        action: "Translate as standard demonstrative/interrogative 'this', 'that', 'what is this'",
-        confidence: 0.97
-      };
-    } else if (targetPatternDef.name.includes('Contraction')) {
-      candidateRule = {
-        ruleName: "Negative Auxiliary Contraction Reduction ('dussin' -> 'doesn't')",
-        patternType: "word_merging",
-        hypothesis: "Negative auxiliary verb 'doesn't' is articulated with central vowel laxing and elision of the coronal plosive coda /t/, producing the characteristic dissyllabic phonetic form 'dussin'.",
-        condition: "Spoken token 'dussin' preceding a base verb",
-        action: "Translate as 3rd person negative auxiliary 'doesn't'",
-        confidence: 0.95
-      };
-    } else {
-      candidateRule = {
-        ruleName: "Medial Cluster Reduction in Compound Entities ('ba-man' -> 'Batman')",
-        patternType: "word_merging",
-        hypothesis: "Paxton deletes syllable-final unreleased coronal plosives (/t/) in medial consonant clusters of proper names, creating glottalized hyphenated compounds ('ba-man' for 'Batman', 'spi-man' for 'Spiderman').",
-        condition: "Phonetic pattern 'ba-man' or similar superhero/character compound",
-        action: "Reconstruct compound character entity 'Batman'",
-        confidence: 0.98
-      };
-    }
-  }
-
-  hypothesisCycleStatus.activeHypothesis = candidateRule.hypothesis;
-  hypothesisCycleStatus.activeCandidateRule = candidateRule;
-  hypothesisCycleStatus.modelUsed = targetModel;
-
-  // Step 4: Test hypothesis across the library
-  hypothesisCycleStatus.currentStep = 'testing_across_corpus';
-  hypothesisCycleStatus.stepDescription = `Step 4: Testing hypothesis across ${trainingData.length} library phrases...`;
-  pushHypothesisLog(`Step 4: Validating hypothesis across ${trainingData.length} phrases in library...`);
-
-  const supportedExamples: any[] = [];
-  const counterExamples: any[] = [];
-
-  for (const pair of trainingData) {
-    const s = (pair.sound || '').toLowerCase();
-    const m = (pair.meaning || '').toLowerCase();
-
-    if (candidateRule.patternType === 'intrusive_article') {
-      if (/\b(nee|need|want|wan|go|went)\s+a\s+(hell|help|sleep|play|eat|drink|work)\b/i.test(s)) {
-        if (!/\ba\s+(help|sleep|play)\b/i.test(m)) {
-          supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Dropped 'a' before mass noun / verb" });
-        } else {
-          counterExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Retained 'a'" });
-        }
-      } else if (/\ba\s+(cookie|toy|ball|car|cup|book)\b/i.test(s) && /\ba\s+(cookie|toy|ball|car|cup|book)\b/i.test(m)) {
-        supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Countable noun preserved 'a'" });
+    let llmRule: any = null;
+    try {
+      const rawRes = await queryLlm(gemmaPrompt, targetModel, true);
+      if (rawRes) {
+        let clean = rawRes.trim();
+        const m = clean.match(/\{[\s\S]*\}/);
+        if (m) clean = m[0];
+        llmRule = JSON.parse(clean);
       }
-    } else if (candidateRule.patternType === 'consonant_deletion') {
-      if (/\bnee\b/i.test(s)) {
-        if (/\bneed\b/i.test(m)) {
-          supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Restored 'nee' -> 'need'" });
-        } else {
-          counterExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Meaning did not require 'need'" });
-        }
-      }
-      if (/\bwa is dis\b/i.test(s)) {
-        if (/\bwhat is this\b/i.test(m)) {
-          supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Restored 'wa is dis' -> 'what is this'" });
-        }
-      }
-      if (/\bgoo(h)?\b/i.test(s) && /\bgood\b/i.test(m)) {
-        supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Restored 'goo' -> 'good'" });
-      }
-    } else if (candidateRule.patternType === 'word_merging') {
-      if (/\bdussin\b/i.test(s)) {
-        if (/\bdoesn't\b/i.test(m) || /\bdon't\b/i.test(m)) {
-          supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Resolved 'dussin' -> 'doesn't'" });
-        } else {
-          counterExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Counter example" });
-        }
-      }
-      if (/\bba-man\b/i.test(s) && /\bbatman\b/i.test(m)) {
-        supportedExamples.push({ spoken: pair.sound, intended: pair.meaning, note: "Resolved 'ba-man' -> 'Batman'" });
-      }
-    }
-  }
+    } catch (e) {}
 
-  // Ensure minimum realistic support examples
-  if (supportedExamples.length === 0 && candidateRule.patternType === 'intrusive_article') {
-    supportedExamples.push(
-      { spoken: "i nee a hell", intended: "I need some help", note: "Omitted 'a' before mass noun 'help'" },
-      { spoken: "he go a sleep", intended: "He goes to sleep", note: "Omitted 'a' before verb 'sleep'" }
-    );
-  }
-  if (supportedExamples.length === 0 && candidateRule.patternType === 'consonant_deletion') {
-    supportedExamples.push(
-      { spoken: "i nee a hell", intended: "I need some help", note: "Restores 'nee' -> 'need'" },
-      { spoken: "nee wa-wa", intended: "Need water", note: "Restores 'nee' -> 'need'" }
-    );
-  }
-
-  const totalEvaluated = supportedExamples.length + counterExamples.length;
-  const accuracy = totalEvaluated > 0 ? (supportedExamples.length / totalEvaluated) : 0.92;
-  const minSupport = appSettings.hypothesisMinSupport || 2;
-  const minConfidence = appSettings.hypothesisMinConfidence || 0.70;
-
-  hypothesisCycleStatus.currentStep = 'evaluating_decision';
-  hypothesisCycleStatus.testedPairsCount = totalEvaluated;
-
-  const isConfirmed = supportedExamples.length >= minSupport && accuracy >= minConfidence;
-
-  if (isConfirmed) {
-    const existingIdx = grammarRulebook.findIndex(r => r.ruleName.toLowerCase() === candidateRule.ruleName.toLowerCase());
-    const ruleEntry: any = {
-      id: existingIdx >= 0 ? grammarRulebook[existingIdx].id : "rule_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
-      ruleName: candidateRule.ruleName,
-      patternType: candidateRule.patternType,
-      hypothesis: candidateRule.hypothesis,
-      condition: candidateRule.condition,
-      action: candidateRule.action,
-      status: 'confirmed',
-      confidence: candidateRule.confidence || 0.95,
-      accuracy: Math.round(accuracy * 100) / 100,
-      testedCount: totalEvaluated,
-      supportedExamples,
-      counterExamples,
-      createdAt: existingIdx >= 0 ? grammarRulebook[existingIdx].createdAt : new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      enabled: true
+    const text = (v: unknown, fallback: string) => (typeof v === 'string' && v.trim() ? v.trim() : fallback);
+    const llmConfidence = typeof llmRule?.confidence === 'number' && isFinite(llmRule.confidence) ? llmRule.confidence : template.confidence;
+    const candidateRule = {
+      ruleName: target.name,
+      patternType: target.patternType,
+      patternKey: target.key,
+      hypothesis: text(llmRule?.hypothesis, template.hypothesis),
+      condition: text(llmRule?.condition, template.condition),
+      action: text(llmRule?.action, template.action),
+      confidence: Math.min(1, Math.max(0, llmConfidence))
     };
 
-    if (existingIdx >= 0) {
-      grammarRulebook[existingIdx] = ruleEntry;
-    } else {
-      grammarRulebook.push(ruleEntry);
-    }
-    saveGrammarRulebook();
-    hypothesisCycleStatus.confirmedRulesCount++;
-    hypothesisCycleStatus.stepDescription = `Confirmed rule: "${candidateRule.ruleName}" (${(accuracy * 100).toFixed(0)}% empirical support)!`;
-    pushHypothesisLog(`✅ CONFIRMED: "${candidateRule.ruleName}" with ${supportedExamples.length} supporting samples and ${(accuracy * 100).toFixed(0)}% accuracy.`);
-  } else {
-    hypothesisCycleStatus.rejectedRulesCount++;
-    hypothesisCycleStatus.stepDescription = `Hypothesis for "${candidateRule.ruleName}" did not meet confirmation criteria (${(accuracy * 100).toFixed(0)}% accuracy). Refinement queued.`;
-    pushHypothesisLog(`⚠️ REJECTED / NEEDS REFINEMENT: Accuracy ${(accuracy * 100).toFixed(0)}% (< threshold ${minConfidence * 100}%). Repeating with new assumption.`);
-  }
+    hypothesisCycleStatus.activeHypothesis = candidateRule.hypothesis;
+    hypothesisCycleStatus.activeCandidateRule = candidateRule;
+    hypothesisCycleStatus.modelUsed = targetModel;
 
-  hypothesisCycleStatus.active = false;
-  return {
-    success: true,
-    confirmed: isConfirmed,
-    rule: candidateRule,
-    accuracy,
-    supportedCount: supportedExamples.length,
-    counterCount: counterExamples.length,
-    rulebookCount: grammarRulebook.length
-  };
+    // Step 4: test the hypothesis against what the user actually verified. Nothing here is invented:
+    // a pattern with no matching pairs has no support and cannot be confirmed.
+    hypothesisCycleStatus.currentStep = 'testing_across_corpus';
+    hypothesisCycleStatus.stepDescription = `Step 4: Testing hypothesis across ${trainingData.length} library phrases...`;
+    pushHypothesisLog(`Step 4: Validating hypothesis across ${trainingData.length} phrases in library...`);
+
+    const { supported: supportedExamples, counter: counterExamples } = evaluatePattern(target.key, trainingData);
+
+    const totalEvaluated = supportedExamples.length + counterExamples.length;
+    const accuracy = totalEvaluated > 0 ? supportedExamples.length / totalEvaluated : 0;
+    const minSupport = appSettings.hypothesisMinSupport || 2;
+    const minConfidence = appSettings.hypothesisMinConfidence || 0.70;
+
+    hypothesisCycleStatus.currentStep = 'evaluating_decision';
+    hypothesisCycleStatus.testedPairsCount = totalEvaluated;
+
+    const isConfirmed = supportedExamples.length >= minSupport && accuracy >= minConfidence;
+
+    if (isConfirmed) {
+      // Re-use the matching rule (same pattern key, same name, or the same built-in behaviour) instead of duplicating it.
+      const existingIdx = grammarRulebook.findIndex(r => {
+        if (r.match) return false; // user-defined replacement rules are never overwritten by the engine
+        if (r.patternKey === target.key) return true;
+        if (String(r.ruleName || '').toLowerCase() === target.name.toLowerCase()) return true;
+        const keys = builtinKeysForRule(r);
+        return keys.length === 1 && keys[0] === target.key;
+      });
+      const existing = existingIdx >= 0 ? grammarRulebook[existingIdx] : null;
+
+      const ruleEntry: any = {
+        ...(existing || {}),
+        id: existing ? existing.id : "rule_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
+        ruleName: existing?.ruleName || candidateRule.ruleName,
+        patternType: candidateRule.patternType,
+        patternKey: candidateRule.patternKey,
+        hypothesis: candidateRule.hypothesis,
+        condition: candidateRule.condition,
+        action: candidateRule.action,
+        status: 'confirmed',
+        confidence: candidateRule.confidence,
+        accuracy: Math.round(accuracy * 100) / 100,
+        testedCount: totalEvaluated,
+        supportedExamples,
+        counterExamples,
+        createdAt: existing?.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        // A rule the user switched off stays off when the engine re-confirms it.
+        enabled: existing ? existing.enabled !== false : true
+      };
+
+      if (existing) {
+        grammarRulebook[existingIdx] = ruleEntry;
+      } else {
+        grammarRulebook.push(ruleEntry);
+      }
+      saveGrammarRulebook();
+      hypothesisCycleStatus.confirmedRulesCount++;
+      hypothesisCycleStatus.stepDescription = `Confirmed rule: "${ruleEntry.ruleName}" (${(accuracy * 100).toFixed(0)}% empirical support)!`;
+      pushHypothesisLog(`✅ CONFIRMED: "${ruleEntry.ruleName}" with ${supportedExamples.length} supporting samples and ${(accuracy * 100).toFixed(0)}% accuracy.`);
+    } else {
+      hypothesisCycleStatus.rejectedRulesCount++;
+      const why = totalEvaluated === 0
+        ? 'no pairs in the library exercise this pattern yet (add verified examples to test it)'
+        : `${supportedExamples.length} supporting / ${counterExamples.length} counter-examples, accuracy ${(accuracy * 100).toFixed(0)}% (needs >= ${minSupport} supporting and >= ${(minConfidence * 100).toFixed(0)}%)`;
+      hypothesisCycleStatus.stepDescription = `Hypothesis for "${candidateRule.ruleName}" not confirmed: ${why}.`;
+      pushHypothesisLog(`⚠️ NOT CONFIRMED: "${candidateRule.ruleName}": ${why}.`);
+    }
+
+    return {
+      success: true,
+      confirmed: isConfirmed,
+      rule: candidateRule,
+      accuracy,
+      supportedCount: supportedExamples.length,
+      counterCount: counterExamples.length,
+      rulebookCount: grammarRulebook.length
+    };
+  } finally {
+    // Previously only the manual route cleared this, so a crash in continuous mode left the engine "active" forever.
+    hypothesisCycleStatus.active = false;
+  }
 }
 
 function scheduleNextContinuousHypothesis() {
@@ -1778,18 +1895,27 @@ app.post('/api/grammar-rules/continuous', (req, res) => {
 });
 
 app.post('/api/grammar-rules', (req, res) => {
-  const { ruleName, patternType, hypothesis, condition, action } = req.body || {};
+  const { ruleName, patternType, hypothesis, condition, action, patternKey, match, replacement } = req.body || {};
   if (!ruleName || !hypothesis) {
     return res.status(400).json({ error: 'ruleName and hypothesis are required.' });
   }
 
+  const matchClean = typeof match === 'string' ? match.trim() : '';
+  const replacementClean = typeof replacement === 'string' ? replacement.trim() : '';
+  if ((matchClean && !replacementClean) || (!matchClean && replacementClean)) {
+    return res.status(400).json({ error: 'A replacement rule needs both a spoken pattern and what it should become.' });
+  }
+
   const newRule: any = {
     id: "rule_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
-    ruleName: ruleName.trim(),
+    ruleName: String(ruleName).trim(),
     patternType: patternType || 'custom',
-    hypothesis: hypothesis.trim(),
-    condition: (condition || '').trim(),
-    action: (action || '').trim(),
+    // Data-driven behaviour: without these (or a built-in pattern) the decoder has nothing to apply.
+    ...(typeof patternKey === 'string' && patternKey ? { patternKey } : {}),
+    ...(matchClean ? { match: matchClean, replacement: replacementClean } : {}),
+    hypothesis: String(hypothesis).trim(),
+    condition: String(condition || '').trim(),
+    action: String(action || '').trim(),
     status: 'confirmed',
     confidence: 0.95,
     accuracy: 1.0,
@@ -1810,7 +1936,9 @@ app.put('/api/grammar-rules/:id', (req, res) => {
   const rule = grammarRulebook.find(r => r.id === id);
   if (!rule) return res.status(404).json({ error: 'Rule not found' });
 
-  Object.assign(rule, req.body, { updatedAt: new Date().toISOString() });
+  // Never let a client change a rule's identity.
+  const { id: _ignoredId, createdAt: _ignoredCreated, ...patch } = req.body || {};
+  Object.assign(rule, patch, { updatedAt: new Date().toISOString() });
   saveGrammarRulebook();
   res.json(rule);
 });
@@ -1925,86 +2053,31 @@ app.post('/api/grammar-rules/reset', (req, res) => {
     }
   ];
 
-  grammarRulebook = seedRules;
+  // Tie every baseline rule to its built-in behaviour explicitly instead of relying on name matching.
+  const seedKeys: Record<string, string> = {
+    rule_consonant_deletion_nee: 'coda_deletion',
+    rule_intrusive_article_a: 'intrusive_a',
+    rule_word_merging_baman: 'baman',
+    rule_fricative_neutralization_dis: 'th_stopping',
+    rule_negative_contraction_dussin: 'dussin'
+  };
+  grammarRulebook = seedRules.map(r => ({ ...r, patternKey: seedKeys[r.id] }));
   saveGrammarRulebook();
   res.json({ success: true, rules: grammarRulebook });
 });
 
 app.post('/api/grammar-rules/test-phrase', (req, res) => {
-  const phrase = (req.body?.phrase || '').trim();
+  const phrase = String(req.body?.phrase || '').trim();
   if (!phrase) return res.json({ original: '', decoded: '', appliedRules: [] });
 
-  let transformed = phrase.toLowerCase();
-  const applied: any[] = [];
+  // Rulebook preview: run the *same* rule engine the live interpreter uses (no dictionary, so the
+  // result isolates what the rules do). It used to carry its own copy of the logic, which had drifted
+  // (it dropped the "a" in "want a drink" and lower-cased everything).
+  const { text: transformed, applied } = applyGrammarRules(phrase, grammarRulebook);
 
-  for (const rule of grammarRulebook.filter(r => r.status === 'confirmed' && r.enabled !== false)) {
-    let fired = false;
-    let beforeState = transformed;
-
-    if (rule.patternType === 'intrusive_article') {
-      const intrusiveRegex = /\b(nee|need|want|wan|go|went)\s+a\s+(hell|help|sleep|play|eat|drink|pee|work)\b/gi;
-      if (intrusiveRegex.test(transformed)) {
-        transformed = transformed.replace(intrusiveRegex, (match, p1, p2) => {
-          const cleanP1 = (p1 === 'nee' || p1 === 'need') ? 'need' : p1;
-          const cleanP2 = (p2 === 'hell' || p2 === 'help') ? 'some help' : (p2 === 'sleep' ? 'to sleep' : (p2 === 'play' ? 'to play' : p2));
-          return `${cleanP1} ${cleanP2}`;
-        });
-        fired = true;
-      } else if (/\ba\s+(hell|help|sleep|pee)\b/gi.test(transformed)) {
-        transformed = transformed.replace(/\ba\s+(hell|help)\b/gi, 'some help').replace(/\ba\s+sleep\b/gi, 'to sleep');
-        fired = true;
-      }
-    }
-
-    if (rule.patternType === 'consonant_deletion') {
-      if (/\bnee\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bnee\b/gi, 'need');
-        fired = true;
-      }
-      if (/\bhell\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bhell\b/gi, 'help');
-        fired = true;
-      }
-      if (/\bwa is dis\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bwa is dis\b/gi, 'what is this');
-        fired = true;
-      } else if (/\bdis\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bdis\b/gi, 'this');
-        fired = true;
-      }
-      if (/\bdat\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bdat\b/gi, 'that');
-        fired = true;
-      }
-    }
-
-    if (rule.patternType === 'word_merging') {
-      if (/\bba-man\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bba-man\b/gi, 'Batman');
-        fired = true;
-      }
-      if (/\bdussin\b/i.test(transformed)) {
-        transformed = transformed.replace(/\bdussin\b/gi, "doesn't");
-        fired = true;
-      }
-    }
-
-    if (fired && beforeState !== transformed) {
-      applied.push({
-        ruleId: rule.id,
-        ruleName: rule.ruleName,
-        action: rule.action,
-        reason: rule.hypothesis,
-        before: beforeState,
-        after: transformed
-      });
-    }
-  }
-
-  const capitalized = transformed.charAt(0).toUpperCase() + transformed.slice(1);
   res.json({
     original: phrase,
-    decoded: capitalized,
+    decoded: polish(transformed),
     appliedRules: applied
   });
 });
@@ -3298,43 +3371,20 @@ class WhisperEngine {
 
 class RetrievalMemory {
   static async search(text: string) {
-    const keywords = text.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-    
-    // 1. Search Dictionary (dictionaryData)
-    const scoredDict = dictionaryData.map(d => {
-       let score = 0;
-       const wordLower = (d.word || "").toLowerCase();
-       keywords.forEach(kw => {
-          if (wordLower.includes(kw)) score++;
-       });
-       return { item: d, score };
-    });
-    scoredDict.sort((a,b) => b.score - a.score);
-    const topDictMatches = scoredDict.filter(s => s.score > 0).slice(0, 3).map(s => s.item);
+    // Word-based matching only (the old substring matching let "a" or "i" match every entry).
+    const topDictMatches = findRelatedPairs(
+      text,
+      dictionaryData.map(d => ({ sound: d.word, item: d })),
+      3
+    ).map(p => p.item);
 
-    // 2. Search Custom Dictionary (trainingData)
-    const scoredTraining = trainingData.map(t => {
-      let score = 0;
-      const soundLower = (t.sound || "").toLowerCase();
-      keywords.forEach(kw => {
-         if (soundLower.includes(kw)) score++;
-      });
-      return { item: t, score };
-    });
-    scoredTraining.sort((a, b) => b.score - a.score);
-    const topTrainingMatches = scoredTraining.filter(s => s.score > 0).slice(0, 3).map(s => s.item);
+    const topTrainingMatches = findRelatedPairs(text, trainingData, 3);
 
-    // 2. Search Past Interactions
-    const scoredInteractions = interactions.map(interaction => {
-      let score = 0;
-      const textLower = (interaction.whisper_guess || "").toLowerCase();
-      keywords.forEach(kw => {
-         if (textLower.includes(kw)) score++;
-      });
-      return { item: interaction, score };
-    });
-    scoredInteractions.sort((a, b) => b.score - a.score);
-    const topPastInteractions = scoredInteractions.filter(s => s.score > 0).slice(0, 3).map(s => s.item);
+    const topPastInteractions = findRelatedPairs(
+      text,
+      interactions.filter(i => i.finalText).map(i => ({ sound: i.whisper_guess, item: i })),
+      3
+    ).map(p => p.item);
 
     // Dynamic temporal context
     const currentTime = new Date();
@@ -3344,30 +3394,67 @@ class RetrievalMemory {
     else if (hour >= 12 && hour < 17) timeOfDay = "afternoon";
     else if (hour >= 17 && hour < 21) timeOfDay = "evening";
 
-    return { 
-      location: "local device", 
+    return {
+      location: "local device",
       time: timeOfDay,
       dictionary: topDictMatches,
       customDictionary: topTrainingMatches,
-      pastMatches: topPastInteractions 
+      pastMatches: topPastInteractions
     };
   }
 }
 
+function buildEmptyPhases(threshold: number, note: string) {
+  const empty = { phoneticTranscript: '', rawAcousticGuess: '', confidence: 0 };
+  return {
+    phase1: empty,
+    phase1A: empty,
+    phase1B: { initialAssumption: '', miniModelUsed: 'not run', learnedPairsMatched: [], confidence: 0, reasoning: note },
+    phase2: { initialGuess: '', reasoning: note, identifiedAtypicalFeatures: [], nextStepsPlanned: [] },
+    phase3: { appliedRules: [], searchedRulesCount: grammarRulebook.length, ruleTransformedText: '', reasoning: '', newAssumptions: [] },
+    phase4: { matchedDictionaryEntries: [], priorContextUsed: {}, refinedAssumption: '', confidenceScore: 0, isLowCertainty: true, threshold },
+    phase5: { spokenText: '', voiceEngine: 'Web Speech / TTS Voice Model', autoSpoken: false, status: 'ready' as const }
+  };
+}
+
+function currentThreshold(): number {
+  return typeof appSettings.lowCertaintyThreshold === 'number' ? appSettings.lowCertaintyThreshold : 0.78;
+}
+
 class LlamaInterpreter {
   static async interpret(text: string, context: any) {
+    const threshold = currentThreshold();
+
     if (!text || text === "Transcription failed") {
-      const emptyPhaseResult = {
-        phase1: { phoneticTranscript: '', rawAcousticGuess: '', confidence: 0 },
-        phase2: { initialGuess: '', reasoning: 'No acoustic audio detected.', identifiedAtypicalFeatures: [], nextStepsPlanned: [] },
-        phase3: { appliedRules: [], searchedRulesCount: grammarRulebook.length, ruleTransformedText: '', reasoning: '', newAssumptions: [] },
-        phase4: { matchedDictionaryEntries: [], priorContextUsed: {}, refinedAssumption: '', confidenceScore: 0, isLowCertainty: true, threshold: 0.78 },
-        phase5: { spokenText: '', voiceEngine: 'Web Speech / TTS Voice Model', autoSpoken: false, status: 'ready' }
+      return {
+        candidates: [] as any[],
+        confidence: 0,
+        appliedRules: [] as any[],
+        phases: buildEmptyPhases(threshold, 'No acoustic audio detected.'),
+        isLowCertainty: true,
+        didYouMeanPrompt: '',
+        mode: 'clarification' as const
       };
-      return { candidates: [], confidence: 0, appliedRules: [], phases: emptyPhaseResult };
     }
 
-    const textLower = text.toLowerCase().trim();
+    const textTrim = text.trim();
+
+    // ───────────────────────────────────────────────────────────
+    // Deterministic decode: dictionary phrases -> grammar rules -> dictionary words
+    // ───────────────────────────────────────────────────────────
+    const lexicon = buildLexicon(dictionaryData, crossReferenceData);
+    const activeConfirmedRules = grammarRulebook.filter(isRuleActive);
+    const decoded = decodeUtterance(textTrim, { lexicon, rules: grammarRulebook });
+
+    // A user-verified utterance (same words, ignoring case/punctuation) beats any model guess.
+    const exactKey = lexKey(textTrim);
+    const exactPairs = trainingData.filter(t => t.sound && t.meaning && lexKey(t.sound) === exactKey);
+    const exactMeanings: string[] = [];
+    for (const p of exactPairs) {
+      const m = String(p.meaning).trim();
+      if (m && !exactMeanings.some(x => x.toLowerCase() === m.toLowerCase())) exactMeanings.push(m);
+    }
+    const relatedPairs = findRelatedPairs(textTrim, trainingData, 3);
 
     // ───────────────────────────────────────────────────────────
     // PHASE 1A: Whisper Acoustic Phonetic Capture
@@ -3375,165 +3462,83 @@ class LlamaInterpreter {
     const phase1A = {
       phoneticTranscript: text,
       rawAcousticGuess: text,
-      confidence: textLower.length > 0 ? 0.90 : 0.40
+      confidence: 0.90
     };
 
     // ───────────────────────────────────────────────────────────
-    // PHASE 1B: Fine-Tuned Mini LLM Initial Semantic Assumption
+    // PHASE 1B: Mini LLM initial assumption (skipped when a verified pair exists)
     // ───────────────────────────────────────────────────────────
-    const matchedTrainingPairs = trainingData.filter(t => 
-      t.sound && (
-        t.sound.toLowerCase() === textLower || 
-        textLower.includes(t.sound.toLowerCase()) || 
-        t.sound.toLowerCase().includes(textLower)
-      )
-    );
-
-    let miniLlmAssumption = text.charAt(0).toUpperCase() + text.slice(1);
-    const directPairMatch = trainingData.find(t => t.sound && t.sound.toLowerCase() === textLower);
-    if (directPairMatch) {
-      miniLlmAssumption = directPairMatch.meaning;
-    } else if (/\bnee a hell\b/i.test(textLower)) {
-      miniLlmAssumption = "I need help";
-    } else if (/\bwa is dis\b/i.test(textLower)) {
-      miniLlmAssumption = "What is this?";
-    } else if (/\bba-man\b/i.test(textLower)) {
-      miniLlmAssumption = "Batman";
-    }
-
+    let miniLlmAssumption = exactMeanings[0] || decoded.decoded;
     const miniModel = appSettings.miniLlmModel || 'gemma2:2b';
-    try {
-      const miniPrompt = `You are a specialized lightweight AAC edge model trained on Paxton's phonetic speech.
+
+    if (exactMeanings.length === 0) {
+      try {
+        const miniPrompt = `You are a specialized lightweight AAC edge model trained on Paxton's phonetic speech.
 Phonetic input: "${text}"
-Matched Training Pairs: ${JSON.stringify(matchedTrainingPairs.slice(0, 3).map(p => ({ sound: p.sound, meaning: p.meaning })))}
+Dictionary/rule-based draft: "${decoded.decoded}"
+Matched Training Pairs: ${JSON.stringify(relatedPairs.map(p => ({ sound: p.sound, meaning: p.meaning })))}
 
 Output in 1 short phrase: What is your initial 1st-pass translation assumption of what Paxton means?`;
-      const miniRes = await queryLlm(miniPrompt, miniModel, false);
-      if (miniRes && miniRes.trim().length > 0) {
-        const cleanMini = miniRes.trim().replace(/^["']|["']$/g, '').replace(/^(Paxton means|He means|Translation:)\s*/i, '');
-        if (cleanMini && cleanMini.length < 80) {
-          miniLlmAssumption = cleanMini;
+        const miniRes = await queryLlm(miniPrompt, miniModel, false);
+        if (miniRes && miniRes.trim().length > 0) {
+          const cleanMini = miniRes.trim().replace(/^["']|["']$/g, '').replace(/^(Paxton means|He means|Translation:)\s*/i, '');
+          if (cleanMini && cleanMini.length < 80) {
+            miniLlmAssumption = cleanMini;
+          }
         }
+      } catch(e) {
+        console.warn("--> [Phase 1B Mini LLM Note]:", e);
       }
-    } catch(e) {
-      console.warn("--> [Phase 1B Mini LLM Note]:", e);
     }
 
     const phase1B = {
       initialAssumption: miniLlmAssumption,
-      miniModelUsed: `${miniModel} (Fine-Tuned Mini LLM)`,
-      learnedPairsMatched: matchedTrainingPairs.slice(0, 3).map(p => ({ sound: p.sound, meaning: p.meaning })),
-      confidence: directPairMatch ? 0.94 : 0.76,
-      reasoning: directPairMatch
-        ? `Matched fine-tuned phonetic memory pair: "${directPairMatch.sound}" → "${directPairMatch.meaning}"`
+      miniModelUsed: exactMeanings.length > 0 ? 'verified training pair (no model needed)' : `${miniModel} (Fine-Tuned Mini LLM)`,
+      learnedPairsMatched: relatedPairs.map(p => ({ sound: p.sound, meaning: p.meaning })),
+      confidence: exactMeanings.length > 0 ? 0.94 : 0.76,
+      reasoning: exactMeanings.length > 0
+        ? `Matched fine-tuned phonetic memory pair: "${exactPairs[0].sound}" → "${exactMeanings[0]}"`
         : `1st-pass semantic translation generated by Mini LLM based on Paxton's phonetic speech.`
     };
 
     // ───────────────────────────────────────────────────────────
-    // PHASE 2: Larger Primary LLM Contextual Reasoning & Planning
+    // PHASE 2: Contextual reasoning summary (derived from what actually matched)
     // ───────────────────────────────────────────────────────────
-    const identifiedAtypicalFeatures: string[] = [];
-    if (/\b(nee|wan|wa|dis|dat)\b/i.test(textLower)) {
-      identifiedAtypicalFeatures.push("Coda consonant truncation (dropped terminal /d/ or /t/)");
-    }
-    if (/\b(nee|need|want|wan|go|went)\s+a\s+(hell|help|sleep|play|eat|drink|pee|work)\b/i.test(textLower) || /\ba\s+(hell|help|sleep)\b/i.test(textLower)) {
-      identifiedAtypicalFeatures.push("Intrusive article 'a' inserted prior to complement/verb");
-    }
-    if (/\b(hell|bah-roo|woof)\b/i.test(textLower)) {
-      identifiedAtypicalFeatures.push("Atypical phoneme substitution or idiosyncratic vocabulary");
-    }
-    if (/\b(ba-man|dussin)\b/i.test(textLower)) {
-      identifiedAtypicalFeatures.push("Phonetic compound contraction / syllable merging");
+    const identifiedAtypicalFeatures: string[] = decoded.appliedRules.map(r => r.ruleName);
+    if (decoded.matchedEntries.length > 0) {
+      identifiedAtypicalFeatures.push(
+        `Known vocabulary: ${decoded.matchedEntries.slice(0, 4).map(e => `"${e.word}" → "${e.definition}"`).join(', ')}`
+      );
     }
     if (identifiedAtypicalFeatures.length === 0) {
-      identifiedAtypicalFeatures.push("Minor phonetic variance in conversational speech");
+      identifiedAtypicalFeatures.push("No known rule or dictionary entry matched; relying on model inference");
     }
 
     const phase2 = {
       initialGuess: phase1B.initialAssumption,
-      reasoning: `Phase 1A captured phonetic sound: "${text}". Phase 1B Mini LLM proposed initial assumption: "${phase1B.initialAssumption}". The primary LLM analyzes these atypical phonemes (${identifiedAtypicalFeatures.join(', ')}), synthesizes context, and devices the plan: deep search Paxton's Grammar Rulebook, cross-reference Dictionary, and score certainty.`,
+      reasoning: `Phase 1A captured phonetic sound: "${text}". Phase 1B proposed: "${phase1B.initialAssumption}". ${decoded.matchedEntries.length} dictionary entr${decoded.matchedEntries.length === 1 ? 'y' : 'ies'} and ${decoded.appliedRules.length} grammar rule(s) explain ${(decoded.coverage * 100).toFixed(0)}% of the utterance.`,
       identifiedAtypicalFeatures,
       nextStepsPlanned: [
-        "Evaluate Phase 1B Mini LLM assumption against Paxton's confirmed Grammar Rulebook",
-        "Search Paxton's Grammar Rulebook for active verified rules (consonant deletion, intrusive articles, syllable merging)",
-        "Cross-reference active Dictionary and Cross Reference dataset for known phrase mappings",
-        "Compute final probabilistic certainty score with low-certainty threshold (< 78%) gating"
+        "Apply Paxton's confirmed Grammar Rulebook",
+        "Cross-reference the active Dictionary for known words and phrases",
+        `Score certainty and gate auto-speak below ${(threshold * 100).toFixed(0)}%`
       ]
     };
 
     // ───────────────────────────────────────────────────────────
-    // PHASE 3: Grammar Rulebook Deep Search & Transformation
+    // PHASE 3: Grammar Rulebook (applied inside decodeUtterance)
     // ───────────────────────────────────────────────────────────
-    const appliedRules: any[] = [];
-    let ruleBasedDecoded = textLower;
-    const activeConfirmedRules = grammarRulebook.filter(r => r.status === 'confirmed' && r.enabled !== false);
-
-    for (const rule of activeConfirmedRules) {
-      let fired = false;
-      const beforeState = ruleBasedDecoded;
-
-      if (rule.patternType === 'intrusive_article') {
-        const intrusiveRegex = /\b(nee|need|want|wan|go|went)\s+a\s+(hell|help|sleep|play|eat|drink|pee|work)\b/gi;
-        if (intrusiveRegex.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(intrusiveRegex, (match, p1, p2) => {
-            const cleanP1 = (p1 === 'nee' || p1 === 'need') ? 'need' : p1;
-            const cleanP2 = (p2 === 'hell' || p2 === 'help') ? 'some help' : (p2 === 'sleep' ? 'to sleep' : (p2 === 'play' ? 'to play' : p2));
-            return `${cleanP1} ${cleanP2}`;
-          });
-          fired = true;
-        } else if (/\ba\s+(hell|help|sleep|pee)\b/gi.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\ba\s+(hell|help)\b/gi, 'some help').replace(/\ba\s+sleep\b/gi, 'to sleep');
-          fired = true;
-        }
-      }
-
-      if (rule.patternType === 'consonant_deletion') {
-        if (/\bnee\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bnee\b/gi, 'need');
-          fired = true;
-        }
-        if (/\bhell\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bhell\b/gi, 'help');
-          fired = true;
-        }
-        if (/\bwa is dis\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bwa is dis\b/gi, 'what is this');
-          fired = true;
-        } else if (/\bdis\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bdis\b/gi, 'this');
-          fired = true;
-        }
-        if (/\bdat\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bdat\b/gi, 'that');
-          fired = true;
-        }
-      }
-
-      if (rule.patternType === 'word_merging') {
-        if (/\bba-man\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bba-man\b/gi, 'Batman');
-          fired = true;
-        }
-        if (/\bdussin\b/i.test(ruleBasedDecoded)) {
-          ruleBasedDecoded = ruleBasedDecoded.replace(/\bdussin\b/gi, "doesn't");
-          fired = true;
-        }
-      }
-
-      if (fired && beforeState !== ruleBasedDecoded) {
-        appliedRules.push({
-          ruleId: rule.id,
-          ruleName: rule.ruleName,
-          action: rule.action,
-          reason: rule.hypothesis
-        });
-      }
-    }
+    const appliedRules = decoded.appliedRules.map(r => ({
+      ruleId: r.ruleId,
+      ruleName: r.ruleName,
+      action: r.action,
+      reason: r.reason
+    }));
 
     const phase3 = {
       appliedRules,
       searchedRulesCount: activeConfirmedRules.length,
-      ruleTransformedText: ruleBasedDecoded,
+      ruleTransformedText: decoded.ruleTransformedText,
       reasoning: appliedRules.length > 0
         ? `Applied ${appliedRules.length} verified rule(s) from Paxton's Grammar Rulebook: ${appliedRules.map(r => r.ruleName).join(', ')}.`
         : `Searched ${activeConfirmedRules.length} active grammar rules; no structural mutation triggered.`,
@@ -3541,124 +3546,121 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
     };
 
     // ───────────────────────────────────────────────────────────
-    // PHASE 4: Prior Context & Dictionary Cross-Referencing & Final Assumption & Confidence Scoring
+    // PHASE 4: Dictionary, context, final assumption and confidence
     // ───────────────────────────────────────────────────────────
-    const matchedEntries: any[] = [];
-    const allDict = [
-      ...crossReferenceData.map(c => ({ word: c.phonetic, definition: c.meaning, type: c.type })),
-      ...dictionaryData
-    ];
-    allDict.sort((a, b) => (b.word?.length || 0) - (a.word?.length || 0));
+    const matchedEntries = decoded.matchedEntries;
+    const dictDecoded = decoded.decoded;
 
-    for (const d of allDict) {
-      if (d.word && (textLower.includes(d.word.toLowerCase()) || ruleBasedDecoded.includes(d.word.toLowerCase()))) {
-        if (!matchedEntries.find(m => m.word.toLowerCase() === d.word.toLowerCase())) {
-          matchedEntries.push(d);
-        }
-      }
-    }
-
-    // Apply dictionary translations
-    let dictDecoded = ruleBasedDecoded;
-    for (const d of matchedEntries) {
-      if (d.word && d.definition) {
-        const regex = new RegExp(`\\b${d.word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
-        if (regex.test(dictDecoded)) {
-          dictDecoded = dictDecoded.replace(regex, d.definition);
-        }
-      }
-    }
-
-    // Capitalize first letter of intent
-    dictDecoded = dictDecoded.charAt(0).toUpperCase() + dictDecoded.slice(1);
-
-    const promptText = `You are Paxton's specialized communication interpreter. 
+    const promptText = `You are Paxton's specialized communication interpreter.
 The speaker, Paxton, has atypical speech patterns (drops consonants, inserts intrusive 'a', merges words).
 What Whisper transcribed from his phonetic speech: "${text}"
 
-PAXTON'S VERIFIED GRAMMAR RULEBOOK (CRITICAL - APPLY THESE REASONED RULES!):
+Draft produced ONLY by his verified dictionary and grammar rules: "${dictDecoded}"
+Share of his words explained by those rules/dictionary: ${(decoded.coverage * 100).toFixed(0)}%
+
+PAXTON'S VERIFIED GRAMMAR RULEBOOK (apply these):
 ${activeConfirmedRules.map(r => `* [${r.ruleName}] Hypothesis: ${r.hypothesis} -> Condition: ${r.condition} -> Action: ${r.action}`).join('\n')}
 
-Cross-Referenced Phonetic Dictionary Mappings (HIGH PRIORITY!):
-${JSON.stringify(matchedEntries.slice(0, 10))}
+Cross-Referenced Phonetic Dictionary Mappings (HIGH PRIORITY; a "/" means the word is ambiguous):
+${JSON.stringify(matchedEntries.slice(0, 10).map(e => ({ word: e.word, definition: e.definition })))}
 
 Custom Learned Speech Contexts:
-${JSON.stringify(context.customDictionary)}
+${JSON.stringify((context.customDictionary || []).map((p: any) => ({ sound: p.sound, meaning: p.meaning })))}
 
 Past Successful Confirmations:
-${JSON.stringify(context.pastMatches)}
+${JSON.stringify((context.pastMatches || []).map((p: any) => ({ heard: p.whisper_guess, confirmed: p.finalText })))}
 
 TASK:
 Deduce what Paxton actually MEANT to say.
 Translate the phonetic speech into a clean, natural, grammatically correct English sentence.
-CRITICAL: Do NOT simply repeat or echo the raw phonetic speech verbatim. Use the Grammar Rulebook and Dictionary to decode his true intent!
+Do NOT simply repeat or echo the raw phonetic speech. Use the draft, Grammar Rulebook and Dictionary.
+Be honest about uncertainty: only report high confidence when the dictionary or rulebook directly supports the sentence. If you are guessing, report low confidence.
 
-Output a valid JSON object with 3 ranked interpretation candidates:
+Output a valid JSON object with up to 3 ranked interpretation candidates. "probability" and "confidence" are numbers between 0 and 1 that YOU estimate:
 {
   "candidates": [
-    {"id": "A", "text": "Best decoded sentence of his intended meaning", "probability": 0.88},
-    {"id": "B", "text": "Alternative plausible phrasing", "probability": 0.08},
-    {"id": "C", "text": "Contextual alternative", "probability": 0.04}
+    {"id": "A", "text": "<best decoded sentence>", "probability": <number>},
+    {"id": "B", "text": "<alternative plausible phrasing>", "probability": <number>},
+    {"id": "C", "text": "<contextual alternative>", "probability": <number>}
   ],
-  "confidence": 0.88
+  "confidence": <number>
 }`;
 
-    let parsedResult: any = null;
-    try {
-      const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true);
-      if (rawResponse) {
-        let cleanText = rawResponse.trim();
-        const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) cleanText = jsonMatch[0];
-        parsedResult = JSON.parse(cleanText);
+    let candidates: { id: string; text: string; probability: number }[] = [];
+    let confidence = 0;
+
+    if (exactMeanings.length > 0) {
+      // Verified memory: no model call. Several different verified meanings => let the user choose.
+      const ambiguous = exactMeanings.length > 1;
+      const alts: any[] = exactMeanings.map((m, i) => ({ text: m, probability: ambiguous ? (i === 0 ? 0.5 : 0.3) : 0.96 }));
+      if (!exactMeanings.some(m => m.toLowerCase() === dictDecoded.toLowerCase())) {
+        alts.push({ text: dictDecoded, probability: 0.03 });
       }
-    } catch (e) {
-      console.warn("--> [LlamaInterpreter] LLM query note:", e);
-    }
-
-    let candidates: any[] = [];
-    let confidence = 0.70;
-
-    if (parsedResult && Array.isArray(parsedResult.candidates) && parsedResult.candidates.length > 0) {
-      candidates = parsedResult.candidates.map((c: any, idx: number) => {
-        let txt = String(c.text || '').trim();
-        if (txt.toLowerCase() === textLower && dictDecoded.toLowerCase() !== textLower) {
-          txt = dictDecoded;
-        }
-        return {
-          id: c.id || String.fromCharCode(65 + idx),
-          text: txt,
-          probability: typeof c.probability === 'number' ? c.probability : (idx === 0 ? 0.85 : 0.1)
-        };
-      });
-
-      confidence = typeof parsedResult.confidence === 'number'
-        ? Math.min(0.98, Math.max(0.4, parsedResult.confidence))
-        : (candidates[0].probability || 0.85);
+      candidates = sanitizeCandidates(alts);
+      confidence = ambiguous ? 0.84 : 0.95;
     } else {
-      // Fallback: Intelligent Rulebook + Dictionary Decoder
-      const candidateA = (dictDecoded !== textLower && dictDecoded.length > 0)
-        ? dictDecoded 
-        : (text.charAt(0).toUpperCase() + text.slice(1));
+      let parsedResult: any = null;
+      try {
+        const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true);
+        if (rawResponse) {
+          let cleanText = rawResponse.trim();
+          const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
+          if (jsonMatch) cleanText = jsonMatch[0];
+          parsedResult = JSON.parse(cleanText);
+        }
+      } catch (e) {
+        console.warn("--> [LlamaInterpreter] LLM query note:", e);
+      }
 
-      const candidateB = candidateA.includes('need') 
-        ? candidateA.replace(/need/i, 'want') 
-        : (candidateA.endsWith('?') ? candidateA : (candidateA + ' please'));
-      const candidateC = candidateA.includes('some help') ? candidateA.replace('some help', 'help with this') : text;
+      const echo = lexKey(textTrim);
+      const llmCandidates = parsedResult && Array.isArray(parsedResult.candidates)
+        ? sanitizeCandidates(
+            parsedResult.candidates.map((c: any) => {
+              let txt = String(c?.text ?? '').trim();
+              // The model parroted the raw phonetics: use the rule/dictionary decode instead.
+              if (txt && lexKey(txt) === echo && lexKey(dictDecoded) !== echo) txt = dictDecoded;
+              return { text: txt, probability: c?.probability };
+            })
+          )
+        : [];
 
-      const hasDirectMatches = matchedEntries.length > 0 || appliedRules.length > 0;
-      candidates = [
-        { id: 'A', text: candidateA, probability: hasDirectMatches ? 0.90 : 0.70 },
-        { id: 'B', text: candidateB, probability: 0.16 },
-        { id: 'C', text: candidateC, probability: 0.04 }
-      ];
-      confidence = hasDirectMatches ? 0.90 : 0.68;
+      if (llmCandidates.length > 0) {
+        candidates = llmCandidates;
+        const reported = typeof parsedResult.confidence === 'number' && isFinite(parsedResult.confidence)
+          ? parsedResult.confidence
+          : candidates[0].probability;
+        confidence = Math.min(0.98, Math.max(0.4, reported));
+        // Never let an unsupported model guess outrun the evidence...
+        confidence = Math.min(confidence, evidenceCeiling(decoded.coverage));
+        // ...but when the model independently agrees with the dictionary/rule decode, trust the decode's coverage.
+        if (lexKey(candidates[0].text) === lexKey(dictDecoded) && decoded.coverage > 0) {
+          confidence = Math.max(confidence, fallbackConfidence(decoded.coverage));
+        }
+      } else {
+        // Offline fallback: dictionary + rulebook only.
+        const candidateA = decoded.coverage > 0 ? dictDecoded : polish(textTrim);
+        const alts: { text: string; probability: number }[] = [];
+
+        const wantVariant = candidateA.replace(/\bneed\b/i, 'want');
+        if (wantVariant !== candidateA) alts.push({ text: wantVariant, probability: 0.1 });
+
+        // Ambiguous dictionary entries ("what / water") become alternative candidates.
+        for (const e of matchedEntries) {
+          const primary = primaryMeaning(e.definition);
+          for (const alt of alternativeMeanings(e.definition)) {
+            const swapped = candidateA.replace(new RegExp(`\\b${escapeRegExp(primary)}\\b`, 'i'), alt);
+            if (swapped !== candidateA) alts.push({ text: polish(swapped), probability: 0.1 });
+          }
+        }
+        alts.push({ text: polish(textTrim), probability: 0.04 });
+
+        confidence = fallbackConfidence(decoded.coverage);
+        candidates = sanitizeCandidates([{ text: candidateA, probability: confidence }, ...alts]);
+      }
     }
 
-    const threshold = typeof appSettings.lowCertaintyThreshold === 'number'
-      ? appSettings.lowCertaintyThreshold
-      : 0.78;
     const isLowCertainty = confidence < threshold;
+    const mode = routeConfidence(confidence, threshold);
     const didYouMeanPrompt = candidates[0]?.text || '';
 
     const phase4 = {
@@ -3676,12 +3678,13 @@ Output a valid JSON object with 3 ranked interpretation candidates:
     };
 
     // ───────────────────────────────────────────────────────────
-    // PHASE 5: Voice Model Output (TTS Speech Synthesis)
+    // PHASE 5: Voice output. Only auto-speak when the router says "auto"
+    // (previously this fired for "choice" mode too, speaking before the user had chosen).
     // ───────────────────────────────────────────────────────────
     const phase5 = {
       spokenText: candidates[0]?.text || '',
       voiceEngine: 'Web Speech / TTS Voice Model',
-      autoSpoken: !isLowCertainty,
+      autoSpoken: mode === 'auto',
       status: 'ready' as const
     };
 
@@ -3697,11 +3700,10 @@ Output a valid JSON object with 3 ranked interpretation candidates:
 
     console.log(`--> [Interpreter Multi-Phase Summary]`);
     console.log(`    Phase 1A (Whisper): "${phase1A.phoneticTranscript}"`);
-    console.log(`    Phase 1B (Mini LLM Assumption): "${phase1B.initialAssumption}" (Model: ${phase1B.miniModelUsed})`);
-    console.log(`    Phase 2 (LLM Context Reasoning): plan formulated for deep search`);
+    console.log(`    Phase 1B (Assumption): "${phase1B.initialAssumption}" (${phase1B.miniModelUsed})`);
     console.log(`    Phase 3 (Grammar Rules): applied ${phase3.appliedRules.length} rule(s) -> "${phase3.ruleTransformedText}"`);
-    console.log(`    Phase 4 (Dictionary & Context): final="${phase4.refinedAssumption}" confidence=${(confidence*100).toFixed(1)}% (isLowCertainty=${isLowCertainty})`);
-    console.log(`    Phase 5 (Voice Model): ready to speak "${phase5.spokenText}"`);
+    console.log(`    Phase 4 (Dictionary & Context): final="${phase4.refinedAssumption}" confidence=${(confidence*100).toFixed(1)}% coverage=${(decoded.coverage*100).toFixed(0)}% mode=${mode}`);
+    console.log(`    Phase 5 (Voice Model): ${phase5.autoSpoken ? 'will auto-speak' : 'waiting for confirmation'} "${phase5.spokenText}"`);
 
     return {
       candidates,
@@ -3709,16 +3711,15 @@ Output a valid JSON object with 3 ranked interpretation candidates:
       appliedRules,
       phases,
       isLowCertainty,
-      didYouMeanPrompt
+      didYouMeanPrompt,
+      mode
     };
   }
 }
 
 class ConfidenceRouter {
   static route(confidence: number, threshold: number = 0.78) {
-    if (confidence < threshold) return 'clarification';
-    if (confidence >= 0.88) return 'auto';
-    return 'choice';
+    return routeConfidence(confidence, threshold);
   }
 }
 
@@ -3727,46 +3728,57 @@ class DecisionEngine {
     console.log(`\n[${new Date().toISOString()}] 🎙️  NEW AUDIO PIPELINE INITIATED`);
     console.log(`--> Audio Source: ${file ? file.filename || file.path : (textOverride ? 'Client Speech Stream' : 'Microphone Stream')}`);
 
-    let whisperGuess = textOverride || "";
+    let whisperGuess = (textOverride || "").trim();
+    let transcriptionFailed = false;
 
     if (file) {
       const audioInput = await AudioPipeline.process(file);
       const transcribed = await WhisperEngine.transcribe(audioInput);
-      if (transcribed && transcribed !== "Transcription failed") {
+      if (transcribed === "Transcription failed") {
+        transcriptionFailed = true;
+      } else if (transcribed) {
         whisperGuess = transcribed;
       }
     }
 
-    if (!whisperGuess && textOverride) {
-      whisperGuess = textOverride;
-    }
-
-    if (!whisperGuess) {
-      whisperGuess = "i nee a hell"; // baseline fallback test phrase
-    }
-    
-    console.log(`--> [Whisper STT Hypothesis] Guess: "${whisperGuess}"`);
-
     const retrievalContext = await RetrievalMemory.search(whisperGuess);
-    
-    console.log(`--> [Memory Vector DB] Found ${retrievalContext.pastMatches.length} similar past contexts`);
+    const ctx = { location: retrievalContext.location, time: retrievalContext.time };
+
+    // Nothing was heard. Never invent a phrase: this is an assistive device, and speaking
+    // "I need help" when nobody said anything is worse than saying nothing.
+    if (!whisperGuess) {
+      const reason = transcriptionFailed ? 'transcription_failed' : 'no_speech';
+      console.log(`--> [Whisper STT] No usable speech (${reason}); returning an empty result instead of guessing.`);
+      return {
+        whisper_guess: '',
+        candidates: [] as any[],
+        final_confidence: 0,
+        mode: 'clarification' as const,
+        appliedRules: [] as any[],
+        phases: buildEmptyPhases(currentThreshold(), reason === 'transcription_failed' ? 'Transcription failed.' : 'No speech detected.'),
+        isLowCertainty: true,
+        didYouMeanPrompt: '',
+        noSpeech: true,
+        error: reason,
+        context: ctx
+      };
+    }
+
+    console.log(`--> [Whisper STT Hypothesis] Guess: "${whisperGuess}"`);
+    console.log(`--> [Memory] Found ${retrievalContext.pastMatches.length} similar past contexts`);
     console.log(`--> [Context] loc: ${retrievalContext.location}, time: ${retrievalContext.time}`);
 
-    const { candidates, confidence, appliedRules, phases, isLowCertainty, didYouMeanPrompt } = await LlamaInterpreter.interpret(whisperGuess, retrievalContext);
+    const { candidates, confidence, appliedRules, phases, isLowCertainty, didYouMeanPrompt, mode } = await LlamaInterpreter.interpret(whisperGuess, retrievalContext);
 
-    console.log(`--> [Llama/Gemma Interpreter] Generated ${candidates.length} candidates.`);
+    console.log(`--> [Interpreter] Generated ${candidates.length} candidates.`);
     candidates.forEach((c, i) => console.log(`    ${i+1}. "${c.text}" (${(c.probability * 100).toFixed(1)}%)`));
     if (appliedRules && appliedRules.length > 0) {
       console.log(`--> [Applied Grammar Rules] ${appliedRules.map((r: any) => r.ruleName).join(', ')}`);
     }
     console.log(`--> [Confidence Engine] Final Score: ${(confidence * 100).toFixed(1)}%`);
-
-    const threshold = typeof appSettings.lowCertaintyThreshold === 'number' ? appSettings.lowCertaintyThreshold : 0.78;
-    const mode = ConfidenceRouter.route(confidence, threshold);
-    
     console.log(`--> [Decision Router] Mode Selected: ${mode.toUpperCase()} (LowCertainty: ${isLowCertainty})`);
     console.log(`======================================================\n`);
-    
+
     return {
       whisper_guess: whisperGuess,
       candidates,
@@ -3776,7 +3788,7 @@ class DecisionEngine {
       phases,
       isLowCertainty,
       didYouMeanPrompt,
-      context: { location: retrievalContext.location, time: retrievalContext.time }
+      context: ctx
     };
   }
 }
@@ -3785,9 +3797,14 @@ class DecisionEngine {
 // Processing Pipeline Endpoint
 // -----------------------------------------------------
 app.post('/api/process-audio', upload.single('audio'), async (req, res) => {
-  const textInput = (req.body?.text || req.body?.speech || req.query?.text || '').toString().trim();
-  const result = await DecisionEngine.execute(req.file, textInput);
-  res.json(result);
+  try {
+    const textInput = (req.body?.text || req.body?.speech || req.query?.text || '').toString().trim();
+    const result = await DecisionEngine.execute(req.file, textInput);
+    res.json(result);
+  } catch (err: any) {
+    console.error('[process-audio] Pipeline error:', err);
+    res.status(500).json({ error: 'pipeline_failed', message: err?.message || String(err) });
+  }
 });
 
 

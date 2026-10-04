@@ -209,6 +209,12 @@ export interface GrammarRule {
   id: string;
   ruleName: string;
   patternType: 'consonant_deletion' | 'intrusive_article' | 'vowel_reduction' | 'word_merging' | 'prefix_omission' | 'custom';
+  /** Explicit built-in behaviour this rule stands for (intrusive_a, coda_deletion, th_stopping, dussin, baman). */
+  patternKey?: string;
+  /** Data-driven rule: when Paxton says this word/phrase ... */
+  match?: string;
+  /** ... decode it as this. A rule with neither a built-in pattern nor match/replacement only guides the language model. */
+  replacement?: string;
   hypothesis: string; // The linguistic assumption/reasoning
   condition: string; // Trigger/phonetic context
   action: string; // How to translate/decode

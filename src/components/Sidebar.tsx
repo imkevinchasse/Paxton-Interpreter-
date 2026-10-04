@@ -1,5 +1,5 @@
 import { type Interaction, type ViewState } from '../types';
-import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart, Sparkles, BookMarked, GitBranch } from 'lucide-react';
+import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart, Sparkles, BookMarked, GitBranch, Library } from 'lucide-react';
 import React, { useState, useEffect } from 'react';
 
 interface SidebarProps { 
@@ -67,6 +67,23 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
             </div>
             <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
               Phrases & Words
+            </span>
+          </button>
+
+          <button
+            onClick={() => onViewChange('dictionary')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'dictionary'
+                ? 'bg-indigo-100 text-indigo-700 border border-indigo-200'
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <Library className="w-4 h-4 text-indigo-600" />
+              <span>Dictionary Entries</span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-slate-50 text-slate-600 border border-slate-200">
+              Live Edit
             </span>
           </button>
 

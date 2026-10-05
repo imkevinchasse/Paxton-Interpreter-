@@ -158,6 +158,15 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
   const phase1A = phases.phase1A || phases.phase1;
   const phase1B = phases.phase1B;
 
+  const usage = result.usage;
+  const sourceLabel: Record<string, string> = {
+    verified_pair: 'Matched a verified pair',
+    dictionary_rules: 'Dictionary + rulebook',
+    llm_assisted: 'Dictionary + rulebook + language model',
+    llm_only: 'Language model only (nothing in the dictionary or rulebook matched)',
+    unmatched: 'No dictionary or rule match'
+  };
+
   return (
     <div className="w-full bg-slate-50/80 border border-slate-200 rounded-2xl p-4 space-y-3 text-left">
       <div className="flex items-center justify-between pb-2 border-b border-slate-200/80">
@@ -168,9 +177,28 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
           </span>
         </div>
         <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200">
-          Phases 1A &amp; 1B Active
+          {usage ? sourceLabel[usage.source] || usage.source : 'Pipeline'}
         </span>
       </div>
+
+      {usage && (
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700">
+            {usage.dictionaryEntriesUsed} dictionary {usage.dictionaryEntriesUsed === 1 ? 'entry' : 'entries'} used
+          </span>
+          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700">
+            {usage.rulesApplied} grammar {usage.rulesApplied === 1 ? 'rule' : 'rules'} applied
+          </span>
+          <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700">
+            {Math.round(usage.coverage * 100)}% of words explained
+          </span>
+          {usage.draftOverrodeModel && (
+            <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+              Dictionary overrode the language model
+            </span>
+          )}
+        </div>
+      )}
 
       <div className="space-y-2">
         {/* Phase 1A: Whisper Phonetic Equivalent */}

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyDraftToCandidates,
   applyGrammarRules,
   buildLexicon,
   decodeUtterance,
@@ -9,10 +10,13 @@ import {
   fallbackConfidence,
   findExactPair,
   findRelatedPairs,
+  honorsEntry,
+  introducedWords,
   lexKey,
   primaryMeaning,
   routeConfidence,
   sanitizeCandidates,
+  summarizeUsage,
   tokenize,
   type GrammarRuleLike
 } from '../src/lib/decoder';
@@ -228,4 +232,87 @@ test('a match/replacement rule does what it says and ignores its type dropdown',
   });
   assert.equal(applyGrammarRules('bwoo dis nee', [custom]).text, 'blue dis nee');
   assert.equal(applyGrammarRules('bwoo', [{ ...custom, enabled: false }]).text, 'bwoo');
+});
+
+test('a model answer that keeps verified meanings stays on top and the draft is still offered', () => {
+  const matched = [{ word: 'nee', definition: 'need' }, { word: 'dat', definition: 'that' }];
+  const model = sanitizeCandidates([{ text: 'I need that please', probability: 0.8 }]);
+  const out = applyDraftToCandidates(model, 'I need that', matched, 0.6);
+  assert.equal(out.candidates[0].text, 'I need that please');
+  assert.equal(out.draftLeads, false);
+  assert.deepEqual(out.violated, []);
+  assert.ok(out.candidates.some(c => c.text === 'I need that'), 'draft must always be a candidate');
+});
+
+test('a model answer that drops a verified meaning cannot stay on top', () => {
+  const matched = [{ word: 'nee', definition: 'need' }, { word: 'dat', definition: 'that' }];
+  const model = sanitizeCandidates([{ text: 'I want water', probability: 0.95 }, { text: 'Water please', probability: 0.03 }]);
+  const out = applyDraftToCandidates(model, 'I need that', matched, 0.6);
+  assert.equal(out.candidates[0].text, 'I need that');
+  assert.equal(out.draftLeads, true);
+  assert.deepEqual(out.violated, ['nee', 'dat']);
+  assert.ok(out.candidates.length <= 3);
+  assert.ok(out.candidates.every((c, i) => c.id === String.fromCharCode(65 + i)));
+});
+
+test('draft merging is a no-op when nothing was decoded', () => {
+  const model = sanitizeCandidates([{ text: 'Hello', probability: 0.5 }]);
+  assert.deepEqual(applyDraftToCandidates(model, 'hello', [], 0).candidates, model);
+});
+
+test('ambiguous entries are honoured by either of their meanings', () => {
+  assert.equal(honorsEntry('I want water', { definition: 'what / water' }), true);
+  assert.equal(honorsEntry('What is this', { definition: 'what / water' }), true);
+  assert.equal(honorsEntry('I want juice', { definition: 'what / water' }), false);
+  assert.equal(honorsEntry("Mom, give me that", { definition: 'Mom, give me that' }), true);
+});
+
+test('usage summary reports where an answer came from', () => {
+  const lexicon = buildLexicon([{ word: 'nee', definition: 'need' }], []);
+  const hit = decodeUtterance('i nee dat', { lexicon, rules: [] });
+  const miss = decodeUtterance('hello there', { lexicon, rules: [] });
+  assert.equal(summarizeUsage({ verifiedPair: true, llmUsed: false, decoded: hit }).source, 'verified_pair');
+  assert.equal(summarizeUsage({ verifiedPair: false, llmUsed: false, decoded: hit }).source, 'dictionary_rules');
+  assert.equal(summarizeUsage({ verifiedPair: false, llmUsed: true, decoded: hit }).source, 'llm_assisted');
+  assert.equal(summarizeUsage({ verifiedPair: false, llmUsed: true, decoded: miss }).source, 'llm_only');
+  assert.equal(summarizeUsage({ verifiedPair: false, llmUsed: false, decoded: miss }).source, 'unmatched');
+  assert.equal(summarizeUsage({ verifiedPair: false, llmUsed: false, decoded: hit }).dictionaryEntriesUsed, 1);
+});
+
+test('a dictionary entry beats a built-in rule for the same word (editing the dictionary changes the output)', () => {
+  const th = rule({ id: 'th', ruleName: 'Interdental fricative stopping', patternKey: 'th_stopping' });
+  const coda = rule({ id: 'coda', ruleName: 'Terminal deletion', patternKey: 'coda_deletion' });
+  const stock = buildLexicon([{ word: 'dat', definition: 'that' }, { word: 'nee', definition: 'need' }], []);
+  const edited = buildLexicon([{ word: 'dat', definition: 'that one' }, { word: 'nee', definition: 'need' }], []);
+  assert.equal(decodeUtterance('i nee dat', { lexicon: stock, rules: [th, coda] }).decoded, 'I need that');
+  assert.equal(decodeUtterance('i nee dat', { lexicon: edited, rules: [th, coda] }).decoded, 'I need that one');
+  // ...and the dictionary is reported as used, not hidden behind the rule.
+  const used = decodeUtterance('i nee dat', { lexicon: stock, rules: [th, coda] });
+  assert.deepEqual(used.matchedEntries.map(e => e.word).sort(), ['dat', 'nee']);
+});
+
+test('rules still handle what the dictionary does not define', () => {
+  const th = rule({ id: 'th', ruleName: 'Interdental fricative stopping', patternKey: 'th_stopping' });
+  const intrusive = rule({ id: 'a', ruleName: 'Intrusive article', patternKey: 'intrusive_a' });
+  const lex = buildLexicon([{ word: 'nee', definition: 'need' }, { word: 'hell', definition: 'help' }], []);
+  const out = decodeUtterance('he nee a hell dis', { lexicon: lex, rules: [th, intrusive] });
+  assert.equal(out.decoded, 'He need some help this');
+  assert.deepEqual(out.appliedRules.map(r => r.ruleId).sort(), ['a', 'th']);
+});
+
+test('words introduced by rules are reported, skipping little function words', () => {
+  const r = applyGrammarRules('i nee a hell', [rule({ id: 'a', ruleName: 'Intrusive article', patternKey: 'intrusive_a' }), rule({ id: 'c', ruleName: 'Terminal deletion', patternKey: 'coda_deletion' })]);
+  assert.deepEqual(introducedWords(r.applied), ['need', 'help']);
+  assert.deepEqual(introducedWords([]), []);
+});
+
+test('a model answer that ignores what a rule produced loses the top slot', () => {
+  const model = sanitizeCandidates([{ text: 'I want water', probability: 0.95 }]);
+  const out = applyDraftToCandidates(model, 'I need that', [], 0.6, ['need', 'that']);
+  assert.equal(out.candidates[0].text, 'I need that');
+  assert.equal(out.draftLeads, true);
+  assert.deepEqual(out.violated, ['need', 'that']);
+  // harmless rephrasing that keeps the content words is fine
+  const ok = sanitizeCandidates([{ text: 'I need that please', probability: 0.9 }]);
+  assert.equal(applyDraftToCandidates(ok, 'I need that', [], 0.6, ['need', 'that']).draftLeads, false);
 });

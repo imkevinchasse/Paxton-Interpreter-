@@ -36,6 +36,8 @@ export function GrammarRulebookView() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [expandedRuleId, setExpandedRuleId] = useState<string | null>(null);
   const [activeModel, setActiveModel] = useState<string>('gemma2');
+  const [totalSamples, setTotalSamples] = useState<number>(0);
+  const [statusFilter, setStatusFilter] = useState<string>('all');
 
   // Test phrase sandbox state
   const [testPhrase, setTestPhrase] = useState<string>('i nee a hell');
@@ -75,6 +77,7 @@ export function GrammarRulebookView() {
         setRules(data.rules || []);
         setStatus(data.status || null);
         if (data.activeModel) setActiveModel(data.activeModel);
+        if (typeof data.totalSamples === 'number') setTotalSamples(data.totalSamples);
       }
     } catch (e) {
       console.error('Failed to fetch grammar rules:', e);
@@ -90,6 +93,7 @@ export function GrammarRulebookView() {
       if (data) {
         setRules(data.rules || []);
         setStatus(data.status || null);
+        if (typeof data.totalSamples === 'number') setTotalSamples(data.totalSamples);
       }
     } catch (e) {}
   };
@@ -99,6 +103,7 @@ export function GrammarRulebookView() {
     try {
       const res = await fetch('/api/grammar-rules/hypothesize', { method: 'POST' });
       const data = await res.json();
+      if (data && data.success === false && data.message) alert(data.message);
       fetchRules();
     } catch (e) {
       console.error('Error starting hypothesis cycle:', e);
@@ -214,6 +219,7 @@ export function GrammarRulebookView() {
 
   const filteredRules = rules.filter(r => {
     if (selectedFilter !== 'all' && r.patternType !== selectedFilter) return false;
+    if (statusFilter !== 'all' && r.status !== statusFilter) return false;
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       return (
@@ -227,9 +233,13 @@ export function GrammarRulebookView() {
   });
 
   const confirmedCount = rules.filter(r => r.status === 'confirmed').length;
-  const avgAccuracy = rules.length > 0 
-    ? (rules.reduce((acc, r) => acc + (r.accuracy || 0.9), 0) / rules.length) * 100 
-    : 95;
+  const testingCount = rules.filter(r => r.status === 'testing').length;
+  const candidateCount = rules.filter(r => r.status === 'candidate').length;
+  // Only rules that have actually been tested against real pairs count towards accuracy.
+  const testedRules = rules.filter(r => r.status === 'confirmed' && (r.testedCount || 0) > 0);
+  const avgAccuracy: number | null = testedRules.length > 0
+    ? (testedRules.reduce((acc, r) => acc + (r.accuracy || 0), 0) / testedRules.length) * 100
+    : null;
 
   return (
     <div className="w-full max-w-6xl mx-auto space-y-8 pb-16 font-sans">
@@ -316,9 +326,9 @@ export function GrammarRulebookView() {
           </div>
 
           <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4">
-            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Library Samples Tested</span>
+            <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Verified Pairs in Library</span>
             <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-bold text-slate-800">{status?.totalDatasetPairs || 229}</span>
+              <span className="text-3xl font-bold text-slate-800">{totalSamples}</span>
               <span className="text-xs text-slate-500 font-mono">phrases</span>
             </div>
           </div>
@@ -326,8 +336,8 @@ export function GrammarRulebookView() {
           <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4">
             <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-1">Empirical Accuracy</span>
             <div className="flex items-baseline gap-2">
-              <span className="text-3xl font-bold text-emerald-600">{avgAccuracy.toFixed(1)}%</span>
-              <span className="text-xs text-slate-400 font-mono">across corpus</span>
+              <span className="text-3xl font-bold text-emerald-600">{avgAccuracy === null ? '—' : `${avgAccuracy.toFixed(1)}%`}</span>
+              <span className="text-xs text-slate-400 font-mono">{avgAccuracy === null ? 'no tested rules yet' : 'of tested rules'}</span>
             </div>
           </div>
         </div>
@@ -408,17 +418,55 @@ export function GrammarRulebookView() {
             </span>
           </div>
           <span className="text-[11px] text-slate-500 shrink-0">
-            {rules.length} confirmed rules &bull; {status?.rejectedRulesCount || 0} refined
+            {confirmedCount} confirmed &bull; {testingCount} testing &bull; {candidateCount} candidate
           </span>
         </div>
 
+        {/* What the last cycle actually did */}
+        {status?.lastResult ? (
+          <div className={`p-4 rounded-2xl border text-sm space-y-3 ${
+            status.lastResult.outcome === 'confirmed' ? 'bg-emerald-50 border-emerald-200 text-emerald-900' :
+            status.lastResult.outcome === 'kept' ? 'bg-slate-50 border-slate-200 text-slate-800' :
+            status.lastResult.outcome === 'testing' ? 'bg-amber-50 border-amber-200 text-amber-900' :
+            'bg-slate-50 border-slate-200 text-slate-700'
+          }`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[10px] font-bold uppercase tracking-wider opacity-70">Last result &bull; cycle #{status.lastResult.cycle}</span>
+              <span className="px-2 py-0.5 rounded-md text-[10px] font-bold uppercase tracking-wider bg-white/70 border border-current/20">
+                {status.lastResult.outcome === 'confirmed' ? 'Added to rulebook' :
+                 status.lastResult.outcome === 'kept' ? 'Already confirmed' :
+                 status.lastResult.outcome === 'testing' ? 'Needs more evidence' : 'No evidence yet'}
+              </span>
+            </div>
+            <p className="leading-relaxed">{status.lastResult.message}</p>
+            {status.history && status.history.length > 1 && (
+              <div className="pt-2 border-t border-current/10 space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider opacity-60">Recent cycles</span>
+                {status.history.slice(0, 6).map(h => (
+                  <div key={`${h.cycle}-${h.at}`} className="flex items-center justify-between gap-3 text-xs">
+                    <span className="truncate">#{h.cycle} &middot; {h.ruleName}</span>
+                    <span className="shrink-0 font-mono opacity-80">
+                      {h.outcome} &middot; {h.supportedCount}/{h.supportedCount + h.counterCount}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500 italic">
+            No cycle has run yet. &ldquo;Test Next Hypothesis&rdquo; checks one pattern against your verified pairs and reports here
+            whether it was added to the rulebook or what evidence it still needs.
+          </p>
+        )}
+
         {/* Live Terminal Log Drawer */}
         {status?.logs && status.logs.length > 0 && (
-          <div className="bg-slate-950 rounded-2xl p-4 border border-slate-800 text-[11px] font-mono text-slate-400 max-h-36 overflow-y-auto space-y-1">
-            {status.logs.slice(-6).map((log, i) => (
+          <div className="bg-slate-950 rounded-2xl p-4 border border-slate-800 text-[11px] font-mono text-slate-400 max-h-48 overflow-y-auto space-y-1">
+            {status.logs.slice(-20).map((log, i) => (
               <div key={i} className="flex gap-2">
                 <span className="text-slate-600 select-none">&gt;</span>
-                <span className={log.includes('CONFIRMED') ? 'text-emerald-400 font-semibold' : log.includes('REJECTED') ? 'text-amber-400' : 'text-slate-300'}>
+                <span className={log.includes('CONFIRMED') ? 'text-emerald-400 font-semibold' : (log.includes('TESTING') || log.includes('CANDIDATE')) ? 'text-amber-400' : 'text-slate-300'}>
                   {log}
                 </span>
               </div>
@@ -544,10 +592,10 @@ export function GrammarRulebookView() {
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-bold text-slate-800 tracking-tight">
-              Verified Grammar Rulebook
+              Grammar Rulebook
             </h2>
             <p className="text-xs text-slate-500">
-              Validated phonological rules applied directly by the LLaMA interpreter when listening to Paxton.
+              Confirmed rules are applied by the interpreter. Testing and candidate rules are listed with their evidence but are not applied until confirmed.
             </p>
           </div>
 
@@ -587,8 +635,29 @@ export function GrammarRulebookView() {
           ))}
         </div>
 
+        {/* Status filter */}
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mr-1">Status</span>
+          {[
+            { id: 'all', label: `All (${rules.length})` },
+            { id: 'confirmed', label: `Confirmed (${confirmedCount})` },
+            { id: 'testing', label: `Testing (${testingCount})` },
+            { id: 'candidate', label: `Candidate (${candidateCount})` }
+          ].map(f => (
+            <button
+              key={f.id}
+              onClick={() => setStatusFilter(f.id)}
+              className={`px-3 py-1 rounded-lg text-[11px] font-semibold transition ${
+                statusFilter === f.id ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
         {/* Rules List */}
-        <div className="space-y-4">
+        <div className="space-y-4 max-h-[65vh] overflow-y-auto pr-2">
           {filteredRules.length === 0 ? (
             <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl">
               <BookMarked className="w-8 h-8 text-slate-300 mx-auto mb-2" />
@@ -618,11 +687,32 @@ export function GrammarRulebookView() {
                           rule.patternType === 'consonant_deletion' ? 'bg-blue-100 text-blue-800 border border-blue-200' :
                           'bg-purple-100 text-purple-800 border border-purple-200'
                         }`}>
-                          {rule.patternType.replace('_', ' ')}
+                          {rule.patternType.replace(/_/g, ' ')}
                         </span>
-                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                          {(rule.accuracy * 100).toFixed(0)}% Accuracy
-                        </span>
+                        {rule.status === 'testing' && (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                            Testing &middot; not applied
+                          </span>
+                        )}
+                        {rule.status === 'candidate' && (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                            Candidate &middot; no evidence yet
+                          </span>
+                        )}
+                        {rule.status === 'rejected' && (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-red-50 text-red-700 border border-red-200">
+                            Rejected
+                          </span>
+                        )}
+                        {(rule.testedCount || 0) > 0 ? (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            {((rule.accuracy || 0) * 100).toFixed(0)}% &middot; {rule.supportedExamples?.length || 0}/{rule.testedCount} pairs
+                          </span>
+                        ) : (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-50 text-slate-500 border border-slate-200">
+                            untested
+                          </span>
+                        )}
                       </div>
 
                       {/* Linguistic Hypothesis */}
@@ -635,6 +725,7 @@ export function GrammarRulebookView() {
                     <div className="flex items-center gap-2 shrink-0">
                       <button
                         onClick={() => handleToggleRuleEnabled(rule)}
+                        title={rule.status === 'confirmed' ? undefined : 'Only confirmed rules are applied by the interpreter'}
                         className={`px-3 py-1.5 rounded-xl text-xs font-bold uppercase tracking-wider transition ${
                           rule.enabled !== false
                             ? 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800'
@@ -675,6 +766,17 @@ export function GrammarRulebookView() {
                           <p className="text-slate-700 font-mono bg-white p-2.5 rounded-xl border border-slate-200">{rule.action}</p>
                         </div>
                       </div>
+
+                      {rule.match ? (
+                        <p className="text-slate-700 bg-white p-2.5 rounded-xl border border-indigo-200">
+                          <span className="font-bold uppercase tracking-wider text-[10px] text-indigo-500 mr-2">Replaces</span>
+                          <span className="font-mono">&ldquo;{rule.match}&rdquo;</span> &rarr; <span className="font-semibold">&ldquo;{rule.replacement}&rdquo;</span>
+                        </p>
+                      ) : (!rule.patternKey && ['custom', 'vowel_reduction', 'prefix_omission'].includes(rule.patternType)) ? (
+                        <p className="text-slate-500 italic bg-white p-2.5 rounded-xl border border-slate-200">
+                          This rule only guides the language model. Add a &ldquo;When Paxton says&rdquo; pattern to make it work offline too.
+                        </p>
+                      ) : null}
 
                       {/* Supporting Examples */}
                       {rule.supportedExamples && rule.supportedExamples.length > 0 && (

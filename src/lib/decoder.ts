@@ -8,8 +8,9 @@
  * Pipeline used by decodeUtterance():
  *   1. Multi-word dictionary phrases (exact, user-verified idioms) - longest match wins,
  *      and the matched span is protected from every later step.
- *   2. Grammar rulebook (confirmed + enabled rules only).
- *   3. Single-word dictionary entries on whatever is left.
+ *   2. Single-word dictionary entries. A specific entry beats a general rule, so a word the user defined is
+ *      never rewritten by a rule first (editing "dat" in the dictionary must change what is said).
+ *   3. Grammar rulebook (confirmed + enabled rules only) on whatever the dictionary did not explain.
  */
 
 export const AUTO_ACCEPT_CONFIDENCE = 0.88;
@@ -424,7 +425,7 @@ export function applyGrammarRules(
 
 export interface DecodeResult {
   original: string;
-  /** Text after dictionary phrases + grammar rules (before single-word dictionary pass). */
+  /** Text after dictionary phrases and words plus grammar rules (same as `decoded`; kept for the Phase 3 view). */
   ruleTransformedText: string;
   /** Final, polished sentence. */
   decoded: string;
@@ -454,7 +455,6 @@ export function decodeUtterance(
 ): DecodeResult {
   const original = String(text ?? '').trim();
   const originalTokens = tokenize(original);
-  const origNorms = new Set(originalTokens.map(t => t.norm).filter(Boolean));
   const totalTokens = originalTokens.filter(t => t.norm).length;
   const index = buildIndex(opts.lexicon || []);
 
@@ -469,8 +469,22 @@ export function decodeUtterance(
     })
     .join(' ');
 
-  // 2) Grammar rules on the remaining text.
-  const ruled = applyGrammarRules(phraseText, opts.rules);
+  // 2) Single-word dictionary entries (specific beats general).
+  const wordScan = scan(tokenize(phraseText), index, 1, 1);
+  let wordCovered = 0;
+  const wordMatched: LexiconEntry[] = [];
+  const wordText = wordScan.pieces
+    .map(p => {
+      if (p.entry) {
+        wordCovered += 1;
+        if (!wordMatched.includes(p.entry)) wordMatched.push(p.entry);
+      }
+      return p.text;
+    })
+    .join(' ');
+
+  // 3) Grammar rules on what the dictionary did not already explain (intrusive "a", unknown compounds, ...).
+  const ruled = applyGrammarRules(wordText, opts.rules);
   let ruleExplained = 0;
   for (const r of ruled.applied) {
     ruleExplained += multisetRemoved(
@@ -479,20 +493,6 @@ export function decodeUtterance(
     );
   }
 
-  // 3) Single-word dictionary entries on what is left.
-  const wordScan = scan(tokenize(ruled.text), index, 1, 1);
-  let wordCovered = 0;
-  const wordMatched: LexiconEntry[] = [];
-  const wordText = wordScan.pieces
-    .map(p => {
-      if (p.entry) {
-        wordCovered += origNorms.has(lexKey(p.entry.word)) ? 1 : 0;
-        if (!wordMatched.includes(p.entry)) wordMatched.push(p.entry);
-      }
-      return p.text;
-    })
-    .join(' ');
-
   const restore = (s: string) => s.replace(SENT_RE, (_m, i: string) => protectedSpans[Number(i)] ?? '');
 
   const explained = Math.min(totalTokens, phraseScan.coveredTokens + ruleExplained + wordCovered);
@@ -500,7 +500,7 @@ export function decodeUtterance(
   return {
     original,
     ruleTransformedText: polish(restore(ruled.text)),
-    decoded: polish(restore(wordText)),
+    decoded: polish(restore(ruled.text)),
     appliedRules: ruled.applied,
     matchedEntries: [...phraseScan.matched, ...wordMatched.filter(e => !phraseScan.matched.includes(e))],
     coverage: totalTokens > 0 ? explained / totalTokens : 0,
@@ -619,4 +619,127 @@ export function routeConfidence(confidence: number, threshold: number): RouteMod
   if (confidence < threshold) return 'clarification';
   if (confidence >= Math.max(AUTO_ACCEPT_CONFIDENCE, threshold)) return 'auto';
   return 'choice';
+}
+
+// ─────────────────────────────────────────────────────────────
+// Making sure the dictionary and rulebook are actually used
+// ─────────────────────────────────────────────────────────────
+
+/** Does this sentence keep a dictionary entry's verified meaning (or one of its listed alternatives)? */
+export function honorsEntry(sentence: string, entry: { definition: string }): boolean {
+  const meanings = [primaryMeaning(entry.definition), ...alternativeMeanings(entry.definition)];
+  return meanings.some(m => containsPhrase(sentence, m));
+}
+
+const FUNCTION_WORDS = new Set(['a', 'an', 'the', 'some', 'to', 'of', 'is', 'are', 'am', 'do', 'does', 'did', 'be']);
+
+/**
+ * Content words the grammar rules put into the sentence (need, that, Batman ...). A model answer that does not
+ * contain them has ignored the rulebook. Little function words (some, to, a) are skipped so harmless rephrasing
+ * ("I need help" for "I need some help") is not treated as a violation.
+ */
+export function introducedWords(applied: { before: string; after: string }[]): string[] {
+  const out: string[] = [];
+  for (const r of applied || []) {
+    const before = new Map<string, number>();
+    for (const t of tokenize(r.before)) if (t.norm) before.set(t.norm, (before.get(t.norm) || 0) + 1);
+    for (const t of tokenize(r.after)) {
+      if (!t.norm) continue;
+      const left = before.get(t.norm) || 0;
+      if (left > 0) before.set(t.norm, left - 1);
+      else if (!FUNCTION_WORDS.has(t.norm) && !out.includes(t.norm)) out.push(t.norm);
+    }
+  }
+  return out;
+}
+
+export interface DraftMergeResult {
+  candidates: CandidateOut[];
+  /** True when the model's top answer dropped a verified meaning, so the dictionary/rule decode now leads. */
+  draftLeads: boolean;
+  /** Verified entries the model's original top answer failed to keep. */
+  violated: string[];
+}
+
+/**
+ * A model answer must never silently override Paxton's verified dictionary.
+ *  - If the top candidate keeps every matched entry's meaning, it stays on top (the model completed the sentence).
+ *  - If it drops one, the deterministic draft takes the top slot and the model's answers become alternatives.
+ *  - Either way the draft is always offered as a candidate, so the user can pick it.
+ */
+export function applyDraftToCandidates(
+  candidates: CandidateOut[],
+  draft: string,
+  matched: { word: string; definition: string }[],
+  coverage: number,
+  /** Words the grammar rules introduced (see introducedWords): the model's answer must keep them too. */
+  required: string[] = [],
+  max = 3
+): DraftMergeResult {
+  const draftKey = lexKey(draft);
+  if (!draftKey || coverage <= 0) return { candidates, draftLeads: false, violated: [] };
+
+  const raw = candidates.map(c => ({ text: c.text, probability: c.probability }));
+  const top = raw[0];
+  const violated = top
+    ? [
+        ...matched.filter(e => !honorsEntry(top.text, e)).map(e => e.word),
+        ...required.filter(w => !containsPhrase(top.text, w))
+      ]
+    : [];
+  const has = raw.some(c => lexKey(c.text) === draftKey);
+
+  if (violated.length > 0 || !top) {
+    const rest = raw.filter(c => lexKey(c.text) !== draftKey).map(c => ({ ...c, probability: Math.min(c.probability, 0.1) }));
+    const prior = raw.find(c => lexKey(c.text) === draftKey)?.probability ?? 0;
+    return {
+      candidates: sanitizeCandidates([{ text: draft, probability: Math.max(0.8, prior) }, ...rest], max),
+      draftLeads: true,
+      violated
+    };
+  }
+
+  if (has) return { candidates, draftLeads: lexKey(top.text) === draftKey, violated: [] };
+
+  const kept = raw.slice(0, Math.max(1, max - 1));
+  return {
+    candidates: sanitizeCandidates([...kept, { text: draft, probability: 0.08 }], max),
+    draftLeads: false,
+    violated: []
+  };
+}
+
+export interface UsageSummary {
+  source: 'verified_pair' | 'dictionary_rules' | 'llm_assisted' | 'llm_only' | 'unmatched';
+  dictionaryEntriesUsed: number;
+  rulesApplied: number;
+  /** 0..1 share of the heard words the dictionary / rulebook explained. */
+  coverage: number;
+  draft: string;
+  /** The dictionary/rule decode replaced a model answer that contradicted it. */
+  draftOverrodeModel: boolean;
+}
+
+/** One honest line about where an answer came from, so the app can show that the rulebook/dictionary were used. */
+export function summarizeUsage(args: {
+  verifiedPair: boolean;
+  llmUsed: boolean;
+  decoded: DecodeResult;
+  draftOverrodeModel?: boolean;
+}): UsageSummary {
+  const { decoded } = args;
+  const used = decoded.matchedEntries.length > 0 || decoded.appliedRules.length > 0;
+  const source: UsageSummary['source'] = args.verifiedPair
+    ? 'verified_pair'
+    : args.llmUsed
+      ? used ? 'llm_assisted' : 'llm_only'
+      : used ? 'dictionary_rules' : 'unmatched';
+  return {
+    source,
+    dictionaryEntriesUsed: decoded.matchedEntries.length,
+    rulesApplied: decoded.appliedRules.length,
+    coverage: Math.round(decoded.coverage * 1000) / 1000,
+    draft: decoded.decoded,
+    draftOverrodeModel: Boolean(args.draftOverrodeModel)
+  };
 }

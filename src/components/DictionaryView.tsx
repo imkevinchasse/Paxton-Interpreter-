@@ -9,6 +9,7 @@ export function DictionaryView() {
   const [buildStatus, setBuildStatus] = useState({ isBuilding: false, totalItems: 0, processedItems: 0, currentItem: '' });
   
   const [editingItem, setEditingItem] = useState<Partial<DictionaryItem> | null>(null);
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
     fetchDictionary();
@@ -102,16 +103,38 @@ export function DictionaryView() {
     }
   };
 
+  const q = query.trim().toLowerCase();
+  const visible = q
+    ? dictionary.filter(d =>
+        d.word.toLowerCase().includes(q) ||
+        d.definition.toLowerCase().includes(q) ||
+        (d.context || '').toLowerCase().includes(q))
+    : dictionary;
+
   return (
-    <div className="w-full max-w-4xl bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mb-8">
-      <div className="p-6 border-b border-slate-200 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-slate-50">
+    // Fixed-height card: the header and search stay put while the entries scroll.
+    <div className="w-full max-w-4xl bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mb-8 flex flex-col max-h-[calc(100vh-10rem)]">
+      <div className="shrink-0 p-6 border-b border-slate-200 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-slate-50">
         <div className="flex-1">
           <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
             <BookA className="w-6 h-6 text-indigo-600" /> Learned Dictionary
           </h2>
           <p className="text-sm text-slate-500 mt-1">
             Words and slang compiled by the LLM from atypical phonetic translations.
+            The interpreter reads this list live, so edits take effect on the next phrase.
           </p>
+          <div className="mt-3 flex items-center gap-3">
+            <input
+              type="search"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Search words, meanings or context..."
+              className="w-full max-w-xs text-sm border border-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-300"
+            />
+            <span className="text-xs text-slate-500 font-mono shrink-0">
+              {q ? `${visible.length} of ${dictionary.length}` : `${dictionary.length}`} entries
+            </span>
+          </div>
           {buildStatus.isBuilding && (
             <div className="mt-4 bg-indigo-50 border border-indigo-100 rounded-lg p-3">
                <div className="flex justify-between items-center mb-1">
@@ -155,7 +178,7 @@ export function DictionaryView() {
         </div>
       </div>
 
-      <div className="bg-white min-h-[400px]">
+      <div className="bg-white flex-1 min-h-0 overflow-y-auto">
         {loading ? (
           <div className="p-12 text-center text-slate-400 font-mono text-sm">Loading dictionary...</div>
         ) : (
@@ -207,7 +230,13 @@ export function DictionaryView() {
               </div>
             )}
             
-            {dictionary.map(item => (
+            {dictionary.length > 0 && visible.length === 0 && (
+               <div className="col-span-full p-12 text-center text-slate-400 font-mono text-sm">
+                 No entries match &ldquo;{query}&rdquo;.
+               </div>
+            )}
+
+            {visible.map(item => (
               <div key={item.id} className="border border-slate-200 rounded-lg p-4 bg-slate-50 relative group">
                 <div className="absolute top-2 right-2 flex opacity-0 group-hover:opacity-100 transition-opacity bg-white/80 rounded backdrop-blur-sm shadow-sm gap-1 p-0.5">
                    <button
@@ -229,9 +258,11 @@ export function DictionaryView() {
                 <div className="text-slate-800 font-medium mb-2 break-words">
                   = {item.definition}
                 </div>
-                <div className="text-xs text-slate-500 italic mt-2 border-t border-slate-200 pt-2 break-words">
-                  "{item.context}"
-                </div>
+                {item.context && (
+                  <div className="text-xs text-slate-500 italic mt-2 border-t border-slate-200 pt-2 break-words">
+                    "{item.context}"
+                  </div>
+                )}
               </div>
             ))}
           </div>

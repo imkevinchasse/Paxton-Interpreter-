@@ -73,6 +73,16 @@ export interface MultiPhaseInterpretation {
   phase5: InterpreterPhase5VoiceOutput;
 }
 
+/** Where an answer came from: proof that the dictionary and rulebook were (or were not) used. */
+export interface InterpretationUsage {
+  source: 'verified_pair' | 'dictionary_rules' | 'llm_assisted' | 'llm_only' | 'unmatched';
+  dictionaryEntriesUsed: number;
+  rulesApplied: number;
+  coverage: number;
+  draft: string;
+  draftOverrodeModel: boolean;
+}
+
 export interface PipelineResult {
   whisper_guess: string;
   candidates: Candidate[];
@@ -82,6 +92,7 @@ export interface PipelineResult {
   phases?: MultiPhaseInterpretation;
   isLowCertainty?: boolean;
   didYouMeanPrompt?: string;
+  usage?: InterpretationUsage;
   context: {
     location: string;
     time: string;
@@ -107,6 +118,7 @@ export interface AppSettings {
   hypothesisMinConfidence?: number;
   lowCertaintyThreshold?: number; // threshold below which "Did you mean ___?" triggers (e.g. 0.78)
   miniLlmModel?: string; // model for Phase 1B initial assumptions (e.g. gemma2:2b, llama3.2:1b)
+  miniLlmEnabled?: boolean; // Phase 1B small first-guess model. Planned, off by default.
   whisperEndpoint: string;
   speakerIsolationEnabled?: boolean;
   trainingEpochs?: number;
@@ -229,6 +241,25 @@ export interface GrammarRule {
   enabled?: boolean;
 }
 
+export interface HypothesisCycleResult {
+  success: boolean;
+  /** confirmed = added/re-confirmed, kept = already confirmed and stays so, testing = some evidence but not enough, candidate = no evidence yet */
+  outcome: 'confirmed' | 'kept' | 'testing' | 'candidate';
+  message: string;
+  ruleId?: string;
+  ruleName: string;
+  patternKey: string;
+  accuracy: number;
+  supportedCount: number;
+  counterCount: number;
+  minSupport: number;
+  minConfidence: number;
+  rulebookCount: number;
+  confirmedCount: number;
+  cycle: number;
+  at: string;
+}
+
 export interface HypothesisCycleStatus {
   active: boolean;
   isContinuous: boolean;
@@ -244,6 +275,8 @@ export interface HypothesisCycleStatus {
   rejectedRulesCount: number;
   modelUsed: string;
   logs: string[];
+  lastResult?: HypothesisCycleResult | null;
+  history?: HypothesisCycleResult[];
 }
 
 export interface DictionaryDeconstructionWord {

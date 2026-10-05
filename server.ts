@@ -9,7 +9,9 @@ import { exec, spawn, execSync } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import {
+  AUTO_ACCEPT_CONFIDENCE,
   alternativeMeanings,
+  applyDraftToCandidates,
   applyGrammarRules,
   buildLexicon,
   builtinKeysForRule,
@@ -20,13 +22,21 @@ import {
   evidenceCeiling,
   fallbackConfidence,
   findRelatedPairs,
+  introducedWords,
   isRuleActive,
   lexKey,
   polish,
   primaryMeaning,
   routeConfidence,
-  sanitizeCandidates
+  sanitizeCandidates,
+  summarizeUsage
 } from './src/lib/decoder';
+import {
+  buildDeconstructPrompt,
+  buildDictionaryBuildPrompt,
+  buildHypothesisPrompt,
+  buildInterpreterPrompt
+} from './src/lib/prompts';
 
 let geminiAi: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI | null {
@@ -134,6 +144,8 @@ let appSettings: any = {
   gemmaModel: 'gemma2',
   grammarHypothesisModel: 'gemma2',
   miniLlmModel: 'gemma2:2b',
+  // The small first-guess model is planned but not in use yet. Flip this in settings.json to switch it on later.
+  miniLlmEnabled: false,
   hypothesisMinSupport: 2,
   hypothesisMinConfidence: 0.70,
   whisperEndpoint: 'http://localhost:8080',
@@ -563,25 +575,7 @@ async function deconstructPhraseWithLlm(originalSpoken: string, intendedMeaning:
     ? 'Model unavailable: used 1:1 positional word alignment. Review each word before approving.'
     : 'Model unavailable and the spoken/intended phrases have different word counts, so words cannot be aligned automatically. Only the whole phrase will be added; re-analyze when a model is online or add words manually.';
 
-  const promptText = `You are an expert computational linguist specialized in atypical pediatric speech and AAC communication.
-Paxton uttered: "${originalSpoken}"
-What Paxton actually meant: "${intendedMeaning}"
-Context/Notes: "${notes || 'None'}"
-
-TASK:
-Break down this speech pairing into 3 distinct tiers:
-1. "deconstructedWords": Array of individual phonetic words. For each atypical or distinct spoken word, extract what standard English word he intended, its part of speech, and confidence.
-2. "connectedWords": Array of connected 2-word or 3-word n-grams where sounds blend, drop, or link together (e.g., "i nee" -> "I need", "nee a" -> "need some", "a hell" -> "some help"). Include patternNote.
-3. "wholePhrase": The complete phonetic to intended meaning mapping: {"phonetic": "${originalSpoken}", "meaning": "${intendedMeaning}"}.
-4. "llmReasoning": Brief analysis of the phonological processes (e.g. coda consonant deletion, intrusive article).
-
-Output valid JSON only:
-{
-  "deconstructedWords": [{"phonetic": "string", "meaning": "string", "partOfSpeech": "string", "confidence": 0.95}],
-  "connectedWords": [{"phoneticNgram": "string", "meaning": "string", "patternNote": "string"}],
-  "wholePhrase": {"phonetic": "${originalSpoken}", "meaning": "${intendedMeaning}"},
-  "llmReasoning": "string"
-}`;
+  const promptText = buildDeconstructPrompt(originalSpoken, intendedMeaning, notes);
 
   try {
     const rawResponse = await queryLlm(promptText, appSettings.llamaDictionaryModel || appSettings.llamaModel || 'llama3', true);
@@ -593,6 +587,8 @@ Output valid JSON only:
       if (parsed.deconstructedWords && Array.isArray(parsed.deconstructedWords)) {
         const words = parsed.deconstructedWords
           .filter((w: any) => w && typeof w.phonetic === 'string' && typeof w.meaning === 'string' && w.phonetic.trim() && w.meaning.trim())
+          // Grounded in the pair he actually gave us, never invented by the model.
+          .filter((w: any) => containsPhrase(originalSpoken, w.phonetic) && containsPhrase(intendedMeaning, w.meaning))
           .map((w: any) => ({
             phonetic: w.phonetic.trim().toLowerCase(),
             meaning: w.meaning.trim(),
@@ -601,10 +597,11 @@ Output valid JSON only:
           }));
         const connected = (Array.isArray(parsed.connectedWords) ? parsed.connectedWords : fallbackConnected)
           .filter((c: any) => c && typeof c.phoneticNgram === 'string' && typeof c.meaning === 'string' && c.phoneticNgram.trim() && c.meaning.trim())
+          .filter((c: any) => containsPhrase(originalSpoken, c.phoneticNgram) && containsPhrase(intendedMeaning, c.meaning))
           .map((c: any) => ({ ...c, phoneticNgram: c.phoneticNgram.trim().toLowerCase(), meaning: c.meaning.trim() }));
         // Never let the model rewrite the pair the user actually gave us.
         return {
-          deconstructedWords: words,
+          deconstructedWords: words.length > 0 ? words : fallbackWords,
           connectedWords: connected,
           wholePhrase: { phonetic: originalSpoken, meaning: intendedMeaning },
           llmReasoning: parsed.llmReasoning || 'LLM linguistic breakdown completed.'
@@ -911,23 +908,7 @@ app.post('/api/dictionary/build', async (req, res) => {
   try {
     for (const item of toProcess) {
        builderState.currentItem = item.sound;
-       const promptText = `I am building a comprehensive phonetic dictionary to map raw, atypical speech sounds to standard English.
-The phonetic transcription (exact spoken words) is: "${item.sound}"
-The actual intended meaning (what was meant) is: "${item.meaning}"
-
-Analyze the pair word-by-word and phrase-by-phrase. Break down the entire sentence.
-Create entries for ALL words and multi-word phrases whose sound differs from the intended word. You MUST map every atypical part of the phonetic transcription to its intended meaning.
-Even if you have to infer or deduce the mapping based on context, provide your best mapping for every unique sound-to-meaning pair. 
-If words must be grouped together to make sense (e.g. "nee hell" -> "need help"), group them.
-Do not create an entry whose "word" and "definition" are identical.
-
-Output a JSON array of objects representing dictionary entries.
-Format MUST be exactly:
-[
-  {"word": "phonetic word or phrase", "definition": "intended meaning", "context": "the full phrase for context"}
-]
-Example: [{"word": "wor", "definition": "word", "context": "i nee a wor"}, {"word": "nee hell", "definition": "need help", "context": "i nee hell"}]
-Return ONLY the raw JSON array, with no other text, markdown, or explanation.`;
+       const promptText = buildDictionaryBuildPrompt(item.sound, item.meaning);
 
        let success = false;
        try {
@@ -948,6 +929,12 @@ Return ONLY the raw JSON array, with no other text, markdown, or explanation.`;
             const word = typeof ent?.word === 'string' ? ent.word.trim() : '';
             const definition = typeof ent?.definition === 'string' ? ent.definition.trim() : '';
             if (!lexKey(word) || !definition || lexKey(word) === lexKey(definition)) continue;
+            // Grounding: the word must be something he actually said and the meaning must come from what he
+            // meant. This stops a model from inventing dictionary entries that the pair never contained.
+            if (!containsPhrase(item.sound, word) || !containsPhrase(item.meaning, definition)) {
+              console.log(`    [-] Rejected ungrounded entry: "${word}" => "${definition}"`);
+              continue;
+            }
 
             const existing = dictionaryData[findDictIndex(word)];
             if (existing) {
@@ -1554,6 +1541,37 @@ app.delete('/api/cross-reference/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// Shows exactly what the interpreter's own knowledge does with a phrase, with no language model involved:
+// which dictionary entries match, which rules fire, and how much of the phrase they explain.
+app.post('/api/interpreter/diagnose', (req, res) => {
+  const text = String(req.body?.text || '').trim();
+  const lexicon = buildLexicon(dictionaryData, crossReferenceData);
+  const activeRules = grammarRulebook.filter(isRuleActive);
+  const decoded = text ? decodeUtterance(text, { lexicon, rules: grammarRulebook }) : null;
+  const exact = text ? trainingData.find(t => t.sound && t.meaning && lexKey(t.sound) === lexKey(text)) : null;
+
+  res.json({
+    knowledge: {
+      dictionaryEntries: dictionaryData.length,
+      lexiconEntries: lexicon.length,
+      fromCrossReference: lexicon.filter(e => e.source === 'cross_reference').length,
+      activeRules: activeRules.length,
+      inactiveRules: grammarRulebook.length - activeRules.length,
+      verifiedPairs: trainingData.length,
+      miniLlmEnabled: appSettings.miniLlmEnabled === true
+    },
+    ...(decoded ? {
+      text,
+      verifiedPair: exact ? { sound: exact.sound, meaning: exact.meaning } : null,
+      decoded: decoded.decoded,
+      afterRulesOnly: decoded.ruleTransformedText,
+      coverage: decoded.coverage,
+      matchedEntries: decoded.matchedEntries.map(e => ({ word: e.word, definition: e.definition, source: e.source })),
+      appliedRules: decoded.appliedRules.map(r => ({ ruleId: r.ruleId, ruleName: r.ruleName, before: r.before, after: r.after }))
+    } : {})
+  });
+});
+
 app.post('/api/cross-reference/test-interpret', async (req, res) => {
   const text = String(req.body?.text || '').trim();
   if (!text) return res.json({ candidates: [], confidence: 0, matchedEntries: [] });
@@ -1565,27 +1583,14 @@ app.post('/api/cross-reference/test-interpret', async (req, res) => {
   });
   const matchedEntries = decoded.matchedEntries.map(e => ({ phonetic: e.word, meaning: e.definition, type: e.type || 'word' }));
 
-  const promptText = `You are Paxton's communication interpreter.
-Paxton has unique speech patterns (drops consonants, merges words).
-What Whisper transcribed from his speech: "${text}"
-
-Draft from his verified dictionary and grammar rules: "${decoded.decoded}"
-
-Known Phonetic Mappings:
-${JSON.stringify(matchedEntries)}
-
-TASK:
-Deduce what Paxton actually MEANT to say.
-Translate the phonetic speech into a clean, natural English sentence.
-Report your honest confidence between 0 and 1.
-Output JSON:
-{
-  "candidates": [
-    {"id": "A", "text": "<best decoded sentence>", "probability": <number>},
-    {"id": "B", "text": "<alternative plausible phrasing>", "probability": <number>}
-  ],
-  "confidence": <number>
-}`;
+  const promptText = buildInterpreterPrompt({
+    heard: text,
+    draft: decoded.decoded,
+    coverage: decoded.coverage,
+    rules: grammarRulebook.filter(isRuleActive),
+    entries: decoded.matchedEntries,
+    verifiedPairs: verifiedPairsFor(text)
+  });
 
   let candidates: any[] = [];
   let confidence = 0;
@@ -1599,8 +1604,11 @@ Output JSON:
       const parsed = JSON.parse(clean);
       if (parsed && Array.isArray(parsed.candidates)) {
         candidates = sanitizeCandidates(parsed.candidates);
+        const merged = applyDraftToCandidates(candidates, decoded.decoded, decoded.matchedEntries, decoded.coverage, introducedWords(decoded.appliedRules));
+        candidates = merged.candidates;
         const reported = typeof parsed.confidence === 'number' ? parsed.confidence : (candidates[0]?.probability ?? 0);
         confidence = Math.min(reported, evidenceCeiling(decoded.coverage));
+        if (merged.violated.length > 0) confidence = Math.min(confidence, fallbackConfidence(decoded.coverage));
       }
     }
   } catch(e) {}
@@ -1633,7 +1641,9 @@ let hypothesisCycleStatus: any = {
   confirmedRulesCount: 0,
   rejectedRulesCount: 0,
   modelUsed: 'gemma2',
-  logs: []
+  logs: [],
+  lastResult: null,
+  history: []
 };
 
 let continuousTimeout: NodeJS.Timeout | null = null;
@@ -1690,7 +1700,7 @@ const HYPOTHESIS_PATTERNS: { key: string; name: string; patternType: string }[] 
 
 async function runHypothesisCycle(): Promise<any> {
   if (trainingData.length === 0) {
-    return { success: false, message: 'No training data available to test hypotheses.' };
+    return { success: false, message: 'No training data available to test hypotheses. Add verified pairs in the Training Studio first.' };
   }
 
   try {
@@ -1709,40 +1719,38 @@ async function runHypothesisCycle(): Promise<any> {
     hypothesisCycleStatus.stepDescription = `Step 2: Isolated abnormal pattern "${target.name}"`;
     pushHypothesisLog(`Step 2: Isolated abnormal pattern: "${target.name}"`);
 
-    // Step 3: model reasoning (explanatory text only)
+    // Evidence first. It is deterministic and instant, so the model can be briefed with real examples,
+    // and skipped entirely when there is nothing to explain.
+    const { supported: supportedExamples, counter: counterExamples } = evaluatePattern(target.key, trainingData);
+    const totalEvaluated = supportedExamples.length + counterExamples.length;
+    const accuracy = totalEvaluated > 0 ? supportedExamples.length / totalEvaluated : 0;
+    const minSupport = appSettings.hypothesisMinSupport || 2;
+    const minConfidence = appSettings.hypothesisMinConfidence || 0.70;
+
+    // Step 3: the model explains WHY, using only the evidence above.
     const targetModel = appSettings.grammarHypothesisModel || appSettings.gemmaModel || 'gemma2';
     hypothesisCycleStatus.currentStep = 'formulating_hypothesis';
-    hypothesisCycleStatus.stepDescription = `Step 3: Reasoning with ${targetModel} on why pattern occurs...`;
-    pushHypothesisLog(`Step 3: Formulating hypothesis with ${targetModel}...`);
-
-    const gemmaPrompt = `You are a clinical speech-language pathologist and phonologist studying speech variations in a child named Paxton.
-Observed Speech Phenomenon: "${target.name}"
-Paxton Training Pairs:
-${trainingData.slice(0, 10).map((t, idx) => `${idx + 1}. Spoken: "${t.sound}" -> Intended: "${t.meaning}"`).join('\n')}
-
-INSTRUCTIONS:
-1. Explain WHY Paxton exhibits this abnormal pattern (e.g., motor-phonological coda easing, syllable cadence placeholders, consonant dropping).
-2. Formulate a tested condition for when this rule applies (and when it does NOT apply, e.g., when to drop 'a' vs keep 'a').
-3. Define the precise intent translation action.
-
-Output JSON:
-{
-  "hypothesis": "Linguistic reasoning explaining the physiological/phonological cause of the pattern",
-  "condition": "Explicit phonetic trigger condition",
-  "action": "Transformation rule for the intent translator",
-  "confidence": 0.95
-}`;
-
     let llmRule: any = null;
-    try {
-      const rawRes = await queryLlm(gemmaPrompt, targetModel, true);
-      if (rawRes) {
-        let clean = rawRes.trim();
-        const m = clean.match(/\{[\s\S]*\}/);
-        if (m) clean = m[0];
-        llmRule = JSON.parse(clean);
-      }
-    } catch (e) {}
+    if (totalEvaluated > 0) {
+      hypothesisCycleStatus.stepDescription = `Step 3: Reasoning with ${targetModel} on why pattern occurs...`;
+      pushHypothesisLog(`Step 3: Formulating hypothesis with ${targetModel} from ${totalEvaluated} real example(s)...`);
+      try {
+        const rawRes = await queryLlm(
+          buildHypothesisPrompt({ patternName: target.name, patternKey: target.key, supported: supportedExamples, counter: counterExamples }),
+          targetModel,
+          true
+        );
+        if (rawRes) {
+          let clean = rawRes.trim();
+          const m = clean.match(/\{[\s\S]*\}/);
+          if (m) clean = m[0];
+          llmRule = JSON.parse(clean);
+        }
+      } catch (e) {}
+    } else {
+      hypothesisCycleStatus.stepDescription = 'Step 3: No verified pair exercises this pattern yet, so there is nothing to explain.';
+      pushHypothesisLog('Step 3: No verified pair exercises this pattern yet; skipping the model.');
+    }
 
     const text = (v: unknown, fallback: string) => (typeof v === 'string' && v.trim() ? v.trim() : fallback);
     const llmConfidence = typeof llmRule?.confidence === 'number' && isFinite(llmRule.confidence) ? llmRule.confidence : template.confidence;
@@ -1755,40 +1763,52 @@ Output JSON:
       action: text(llmRule?.action, template.action),
       confidence: Math.min(1, Math.max(0, llmConfidence))
     };
-
     hypothesisCycleStatus.activeHypothesis = candidateRule.hypothesis;
     hypothesisCycleStatus.activeCandidateRule = candidateRule;
     hypothesisCycleStatus.modelUsed = targetModel;
 
-    // Step 4: test the hypothesis against what the user actually verified. Nothing here is invented:
-    // a pattern with no matching pairs has no support and cannot be confirmed.
+    // Step 4: report the test against the user's verified pairs.
     hypothesisCycleStatus.currentStep = 'testing_across_corpus';
-    hypothesisCycleStatus.stepDescription = `Step 4: Testing hypothesis across ${trainingData.length} library phrases...`;
-    pushHypothesisLog(`Step 4: Validating hypothesis across ${trainingData.length} phrases in library...`);
-
-    const { supported: supportedExamples, counter: counterExamples } = evaluatePattern(target.key, trainingData);
-
-    const totalEvaluated = supportedExamples.length + counterExamples.length;
-    const accuracy = totalEvaluated > 0 ? supportedExamples.length / totalEvaluated : 0;
-    const minSupport = appSettings.hypothesisMinSupport || 2;
-    const minConfidence = appSettings.hypothesisMinConfidence || 0.70;
+    hypothesisCycleStatus.stepDescription = `Step 4: Tested against ${trainingData.length} library phrases: ${supportedExamples.length} support, ${counterExamples.length} contradict.`;
+    pushHypothesisLog(`Step 4: ${supportedExamples.length} supporting / ${counterExamples.length} contradicting pair(s) across ${trainingData.length} phrases.`);
 
     hypothesisCycleStatus.currentStep = 'evaluating_decision';
     hypothesisCycleStatus.testedPairsCount = totalEvaluated;
 
-    const isConfirmed = supportedExamples.length >= minSupport && accuracy >= minConfidence;
+    const meetsBar = supportedExamples.length >= minSupport && accuracy >= minConfidence;
+    const pct = (accuracy * 100).toFixed(0);
 
-    if (isConfirmed) {
-      // Re-use the matching rule (same pattern key, same name, or the same built-in behaviour) instead of duplicating it.
-      const existingIdx = grammarRulebook.findIndex(r => {
-        if (r.match) return false; // user-defined replacement rules are never overwritten by the engine
-        if (r.patternKey === target.key) return true;
-        if (String(r.ruleName || '').toLowerCase() === target.name.toLowerCase()) return true;
-        const keys = builtinKeysForRule(r);
-        return keys.length === 1 && keys[0] === target.key;
-      });
-      const existing = existingIdx >= 0 ? grammarRulebook[existingIdx] : null;
+    // Re-use the matching rule (same pattern key, same name, or the same built-in behaviour) instead of duplicating it.
+    const existingIdx = grammarRulebook.findIndex(r => {
+      if (r.match) return false; // user-defined replacement rules are never touched by the engine
+      if (r.patternKey === target.key) return true;
+      if (String(r.ruleName || '').toLowerCase() === target.name.toLowerCase()) return true;
+      const keys = builtinKeysForRule(r);
+      return keys.length === 1 && keys[0] === target.key;
+    });
+    const existing = existingIdx >= 0 ? grammarRulebook[existingIdx] : null;
 
+    let outcome: 'confirmed' | 'kept' | 'testing' | 'candidate';
+    let message: string;
+    let savedRule: any = existing;
+
+    if (!meetsBar && existing && existing.status === 'confirmed') {
+      // Never demote a confirmed rule; just refresh its evidence when we actually have some.
+      outcome = 'kept';
+      if (totalEvaluated > 0) {
+        existing.supportedExamples = supportedExamples;
+        existing.counterExamples = counterExamples;
+        existing.accuracy = Math.round(accuracy * 100) / 100;
+        existing.testedCount = totalEvaluated;
+        existing.updatedAt = new Date().toISOString();
+        saveGrammarRulebook();
+      }
+      message = totalEvaluated > 0
+        ? `"${existing.ruleName}" stays confirmed. Fresh evidence: ${supportedExamples.length} supporting / ${counterExamples.length} contradicting (${pct}%).`
+        : `"${existing.ruleName}" stays confirmed. No verified pair exercises it yet, so there is no new evidence.`;
+      pushHypothesisLog(`➡️ KEPT: ${message}`);
+    } else {
+      outcome = meetsBar ? 'confirmed' : totalEvaluated > 0 ? 'testing' : 'candidate';
       const ruleEntry: any = {
         ...(existing || {}),
         id: existing ? existing.id : "rule_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6),
@@ -1798,8 +1818,8 @@ Output JSON:
         hypothesis: candidateRule.hypothesis,
         condition: candidateRule.condition,
         action: candidateRule.action,
-        status: 'confirmed',
-        confidence: candidateRule.confidence,
+        status: outcome,
+        confidence: totalEvaluated > 0 ? candidateRule.confidence : 0,
         accuracy: Math.round(accuracy * 100) / 100,
         testedCount: totalEvaluated,
         supportedExamples,
@@ -1809,34 +1829,51 @@ Output JSON:
         // A rule the user switched off stays off when the engine re-confirms it.
         enabled: existing ? existing.enabled !== false : true
       };
-
-      if (existing) {
-        grammarRulebook[existingIdx] = ruleEntry;
-      } else {
-        grammarRulebook.push(ruleEntry);
-      }
+      if (existing) grammarRulebook[existingIdx] = ruleEntry;
+      else grammarRulebook.push(ruleEntry);
       saveGrammarRulebook();
-      hypothesisCycleStatus.confirmedRulesCount++;
-      hypothesisCycleStatus.stepDescription = `Confirmed rule: "${ruleEntry.ruleName}" (${(accuracy * 100).toFixed(0)}% empirical support)!`;
-      pushHypothesisLog(`✅ CONFIRMED: "${ruleEntry.ruleName}" with ${supportedExamples.length} supporting samples and ${(accuracy * 100).toFixed(0)}% accuracy.`);
-    } else {
-      hypothesisCycleStatus.rejectedRulesCount++;
-      const why = totalEvaluated === 0
-        ? 'no pairs in the library exercise this pattern yet (add verified examples to test it)'
-        : `${supportedExamples.length} supporting / ${counterExamples.length} counter-examples, accuracy ${(accuracy * 100).toFixed(0)}% (needs >= ${minSupport} supporting and >= ${(minConfidence * 100).toFixed(0)}%)`;
-      hypothesisCycleStatus.stepDescription = `Hypothesis for "${candidateRule.ruleName}" not confirmed: ${why}.`;
-      pushHypothesisLog(`⚠️ NOT CONFIRMED: "${candidateRule.ruleName}": ${why}.`);
+      savedRule = ruleEntry;
+
+      if (outcome === 'confirmed') {
+        hypothesisCycleStatus.confirmedRulesCount++;
+        message = `${existing ? 'Re-confirmed' : 'Added to the rulebook'}: "${ruleEntry.ruleName}" with ${supportedExamples.length} supporting / ${counterExamples.length} contradicting pair(s) (${pct}% accuracy).`;
+        pushHypothesisLog(`✅ CONFIRMED: ${message}`);
+      } else if (outcome === 'testing') {
+        hypothesisCycleStatus.rejectedRulesCount++;
+        const needSupport = Math.max(0, minSupport - supportedExamples.length);
+        message = `Not confirmed yet: "${ruleEntry.ruleName}" has ${supportedExamples.length} supporting / ${counterExamples.length} contradicting (${pct}%). It needs ${needSupport > 0 ? `${needSupport} more supporting pair(s)` : `accuracy of at least ${(minConfidence * 100).toFixed(0)}%`}. Saved as "testing" so you can see its evidence; it is not applied while testing.`;
+        pushHypothesisLog(`⚠️ TESTING: ${message}`);
+      } else {
+        hypothesisCycleStatus.rejectedRulesCount++;
+        message = `No verified pair exercises "${ruleEntry.ruleName}" yet. Saved as a candidate; add examples that use this pattern and run it again.`;
+        pushHypothesisLog(`⚠️ CANDIDATE: ${message}`);
+      }
     }
 
-    return {
+    hypothesisCycleStatus.stepDescription = message;
+
+    const result = {
       success: true,
-      confirmed: isConfirmed,
-      rule: candidateRule,
+      confirmed: outcome === 'confirmed',
+      outcome,
+      message,
+      ruleId: savedRule?.id,
+      ruleName: savedRule?.ruleName || candidateRule.ruleName,
+      patternKey: target.key,
       accuracy,
       supportedCount: supportedExamples.length,
       counterCount: counterExamples.length,
-      rulebookCount: grammarRulebook.length
+      minSupport,
+      minConfidence,
+      rule: candidateRule,
+      rulebookCount: grammarRulebook.length,
+      confirmedCount: grammarRulebook.filter(r => r.status === 'confirmed').length,
+      cycle: hypothesisCycleStatus.cycleNumber,
+      at: new Date().toISOString()
     };
+    hypothesisCycleStatus.lastResult = result;
+    hypothesisCycleStatus.history = [result, ...(hypothesisCycleStatus.history || [])].slice(0, 12);
+    return result;
   } finally {
     // Previously only the manual route cleared this, so a crash in continuous mode left the engine "active" forever.
     hypothesisCycleStatus.active = false;
@@ -3404,6 +3441,16 @@ class RetrievalMemory {
   }
 }
 
+/** Verified pairs to show the model: the ones most similar to what was heard first, then a few general examples. */
+function verifiedPairsFor(text: string, max = 6) {
+  const related = findRelatedPairs(text, trainingData, 3);
+  const seen = new Set(related.map(p => lexKey(p.sound)));
+  const rest = trainingData
+    .filter(t => t.sound && t.meaning && !seen.has(lexKey(t.sound)))
+    .slice(0, Math.max(0, max - related.length));
+  return [...related, ...rest];
+}
+
 function buildEmptyPhases(threshold: number, note: string) {
   const empty = { phoneticTranscript: '', rawAcousticGuess: '', confidence: 0 };
   return {
@@ -3470,8 +3517,11 @@ class LlamaInterpreter {
     // ───────────────────────────────────────────────────────────
     let miniLlmAssumption = exactMeanings[0] || decoded.decoded;
     const miniModel = appSettings.miniLlmModel || 'gemma2:2b';
+    // The small first-guess model is planned for later. Until it is switched on, Phase 1B simply reports the
+    // dictionary/rulebook draft as the first assumption and makes no model call.
+    const miniLlmEnabled = appSettings.miniLlmEnabled === true;
 
-    if (exactMeanings.length === 0) {
+    if (exactMeanings.length === 0 && miniLlmEnabled) {
       try {
         const miniPrompt = `You are a specialized lightweight AAC edge model trained on Paxton's phonetic speech.
 Phonetic input: "${text}"
@@ -3493,12 +3543,18 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
 
     const phase1B = {
       initialAssumption: miniLlmAssumption,
-      miniModelUsed: exactMeanings.length > 0 ? 'verified training pair (no model needed)' : `${miniModel} (Fine-Tuned Mini LLM)`,
+      miniModelUsed: exactMeanings.length > 0
+        ? 'verified training pair (no model needed)'
+        : miniLlmEnabled ? `${miniModel} (Fine-Tuned Mini LLM)` : 'not enabled yet (planned); using dictionary + rulebook draft',
       learnedPairsMatched: relatedPairs.map(p => ({ sound: p.sound, meaning: p.meaning })),
-      confidence: exactMeanings.length > 0 ? 0.94 : 0.76,
+      confidence: exactMeanings.length > 0
+        ? 0.94
+        : miniLlmEnabled ? 0.76 : (decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : 0.3),
       reasoning: exactMeanings.length > 0
         ? `Matched fine-tuned phonetic memory pair: "${exactPairs[0].sound}" → "${exactMeanings[0]}"`
-        : `1st-pass semantic translation generated by Mini LLM based on Paxton's phonetic speech.`
+        : miniLlmEnabled
+          ? `1st-pass semantic translation generated by Mini LLM based on Paxton's phonetic speech.`
+          : `The small first-guess model is not switched on yet, so the first assumption is the draft built from the dictionary and grammar rulebook alone.`
     };
 
     // ───────────────────────────────────────────────────────────
@@ -3551,43 +3607,21 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
     const matchedEntries = decoded.matchedEntries;
     const dictDecoded = decoded.decoded;
 
-    const promptText = `You are Paxton's specialized communication interpreter.
-The speaker, Paxton, has atypical speech patterns (drops consonants, inserts intrusive 'a', merges words).
-What Whisper transcribed from his phonetic speech: "${text}"
-
-Draft produced ONLY by his verified dictionary and grammar rules: "${dictDecoded}"
-Share of his words explained by those rules/dictionary: ${(decoded.coverage * 100).toFixed(0)}%
-
-PAXTON'S VERIFIED GRAMMAR RULEBOOK (apply these):
-${activeConfirmedRules.map(r => `* [${r.ruleName}] Hypothesis: ${r.hypothesis} -> Condition: ${r.condition} -> Action: ${r.action}`).join('\n')}
-
-Cross-Referenced Phonetic Dictionary Mappings (HIGH PRIORITY; a "/" means the word is ambiguous):
-${JSON.stringify(matchedEntries.slice(0, 10).map(e => ({ word: e.word, definition: e.definition })))}
-
-Custom Learned Speech Contexts:
-${JSON.stringify((context.customDictionary || []).map((p: any) => ({ sound: p.sound, meaning: p.meaning })))}
-
-Past Successful Confirmations:
-${JSON.stringify((context.pastMatches || []).map((p: any) => ({ heard: p.whisper_guess, confirmed: p.finalText })))}
-
-TASK:
-Deduce what Paxton actually MEANT to say.
-Translate the phonetic speech into a clean, natural, grammatically correct English sentence.
-Do NOT simply repeat or echo the raw phonetic speech. Use the draft, Grammar Rulebook and Dictionary.
-Be honest about uncertainty: only report high confidence when the dictionary or rulebook directly supports the sentence. If you are guessing, report low confidence.
-
-Output a valid JSON object with up to 3 ranked interpretation candidates. "probability" and "confidence" are numbers between 0 and 1 that YOU estimate:
-{
-  "candidates": [
-    {"id": "A", "text": "<best decoded sentence>", "probability": <number>},
-    {"id": "B", "text": "<alternative plausible phrasing>", "probability": <number>},
-    {"id": "C", "text": "<contextual alternative>", "probability": <number>}
-  ],
-  "confidence": <number>
-}`;
+    const promptText = buildInterpreterPrompt({
+      heard: text,
+      draft: dictDecoded,
+      coverage: decoded.coverage,
+      rules: activeConfirmedRules,
+      entries: matchedEntries,
+      verifiedPairs: verifiedPairsFor(textTrim),
+      pastConfirmations: (context?.pastMatches || []).map((p: any) => ({ heard: p.whisper_guess, confirmed: p.finalText })),
+      timeOfDay: context?.time
+    });
 
     let candidates: { id: string; text: string; probability: number }[] = [];
     let confidence = 0;
+    let llmUsed = false;
+    let draftOverrodeModel = false;
 
     if (exactMeanings.length > 0) {
       // Verified memory: no model call. Several different verified meanings => let the user choose.
@@ -3625,7 +3659,19 @@ Output a valid JSON object with up to 3 ranked interpretation candidates. "proba
         : [];
 
       if (llmCandidates.length > 0) {
-        candidates = llmCandidates;
+        llmUsed = true;
+        const llmTopAgrees = lexKey(llmCandidates[0].text) === lexKey(dictDecoded);
+
+        // The model may complete the sentence, but it may not override his verified dictionary. If its top
+        // answer drops a verified meaning, the dictionary/rule decode takes the lead and the model's answers
+        // become alternatives.
+        const merged = applyDraftToCandidates(llmCandidates, dictDecoded, matchedEntries, decoded.coverage, introducedWords(decoded.appliedRules));
+        candidates = merged.candidates;
+        draftOverrodeModel = merged.violated.length > 0;
+        if (draftOverrodeModel) {
+          console.log(`--> [Interpreter] Model dropped verified meaning(s) for ${merged.violated.map(w => `"${w}"`).join(', ')}; using the dictionary/rule decode instead.`);
+        }
+
         const reported = typeof parsedResult.confidence === 'number' && isFinite(parsedResult.confidence)
           ? parsedResult.confidence
           : candidates[0].probability;
@@ -3633,8 +3679,12 @@ Output a valid JSON object with up to 3 ranked interpretation candidates. "proba
         // Never let an unsupported model guess outrun the evidence...
         confidence = Math.min(confidence, evidenceCeiling(decoded.coverage));
         // ...but when the model independently agrees with the dictionary/rule decode, trust the decode's coverage.
-        if (lexKey(candidates[0].text) === lexKey(dictDecoded) && decoded.coverage > 0) {
+        if (llmTopAgrees && decoded.coverage > 0) {
           confidence = Math.max(confidence, fallbackConfidence(decoded.coverage));
+        }
+        // A model that contradicted the dictionary is never auto-spoken: he (or his carer) confirms first.
+        if (draftOverrodeModel) {
+          confidence = Math.min(fallbackConfidence(decoded.coverage), AUTO_ACCEPT_CONFIDENCE - 0.01);
         }
       } else {
         // Offline fallback: dictionary + rulebook only.
@@ -3662,6 +3712,7 @@ Output a valid JSON object with up to 3 ranked interpretation candidates. "proba
     const isLowCertainty = confidence < threshold;
     const mode = routeConfidence(confidence, threshold);
     const didYouMeanPrompt = candidates[0]?.text || '';
+    const usage = summarizeUsage({ verifiedPair: exactMeanings.length > 0, llmUsed, decoded, draftOverrodeModel });
 
     const phase4 = {
       matchedDictionaryEntries: matchedEntries.map(m => ({ word: m.word, definition: m.definition, type: m.type })),
@@ -3704,6 +3755,7 @@ Output a valid JSON object with up to 3 ranked interpretation candidates. "proba
     console.log(`    Phase 3 (Grammar Rules): applied ${phase3.appliedRules.length} rule(s) -> "${phase3.ruleTransformedText}"`);
     console.log(`    Phase 4 (Dictionary & Context): final="${phase4.refinedAssumption}" confidence=${(confidence*100).toFixed(1)}% coverage=${(decoded.coverage*100).toFixed(0)}% mode=${mode}`);
     console.log(`    Phase 5 (Voice Model): ${phase5.autoSpoken ? 'will auto-speak' : 'waiting for confirmation'} "${phase5.spokenText}"`);
+    console.log(`    Used: source=${usage.source} dictionaryEntries=${usage.dictionaryEntriesUsed} rules=${usage.rulesApplied} coverage=${(usage.coverage * 100).toFixed(0)}%${usage.draftOverrodeModel ? ' (dictionary overrode model)' : ''}`);
 
     return {
       candidates,
@@ -3712,7 +3764,8 @@ Output a valid JSON object with up to 3 ranked interpretation candidates. "proba
       phases,
       isLowCertainty,
       didYouMeanPrompt,
-      mode
+      mode,
+      usage
     };
   }
 }
@@ -3768,7 +3821,7 @@ class DecisionEngine {
     console.log(`--> [Memory] Found ${retrievalContext.pastMatches.length} similar past contexts`);
     console.log(`--> [Context] loc: ${retrievalContext.location}, time: ${retrievalContext.time}`);
 
-    const { candidates, confidence, appliedRules, phases, isLowCertainty, didYouMeanPrompt, mode } = await LlamaInterpreter.interpret(whisperGuess, retrievalContext);
+    const { candidates, confidence, appliedRules, phases, isLowCertainty, didYouMeanPrompt, mode, usage } = await LlamaInterpreter.interpret(whisperGuess, retrievalContext);
 
     console.log(`--> [Interpreter] Generated ${candidates.length} candidates.`);
     candidates.forEach((c, i) => console.log(`    ${i+1}. "${c.text}" (${(c.probability * 100).toFixed(1)}%)`));
@@ -3788,6 +3841,7 @@ class DecisionEngine {
       phases,
       isLowCertainty,
       didYouMeanPrompt,
+      usage,
       context: ctx
     };
   }

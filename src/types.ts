@@ -228,6 +228,8 @@ export interface GrammarRule {
   /** ... decode it as this. A rule with neither a built-in pattern nor match/replacement only guides the language model. */
   replacement?: string;
   hypothesis: string; // The linguistic assumption/reasoning
+  clinicalCategory?: string; // Clinical pathology category (e.g. Syllable Structure, Substitution, Morphosyntax, Gestalt)
+  clinicalWhy?: string; // Physiological / neuromotor / articulatory rationale
   condition: string; // Trigger/phonetic context
   action: string; // How to translate/decode
   status: 'confirmed' | 'testing' | 'rejected' | 'candidate';

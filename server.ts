@@ -7,7 +7,6 @@ import os from 'os';
 import util from 'util';
 import { exec, spawn, execSync } from 'child_process';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
 import {
   AUTO_ACCEPT_CONFIDENCE,
   alternativeMeanings,
@@ -29,7 +28,9 @@ import {
   primaryMeaning,
   routeConfidence,
   sanitizeCandidates,
-  summarizeUsage
+  summarizeUsage,
+  resolveAcousticPhonetics,
+  type PatternCheck
 } from './src/lib/decoder';
 import {
   buildDeconstructPrompt,
@@ -38,72 +39,137 @@ import {
   buildInterpreterPrompt
 } from './src/lib/prompts';
 
-let geminiAi: GoogleGenAI | null = null;
-function getGeminiClient(): GoogleGenAI | null {
-  if (!process.env.GEMINI_API_KEY) return null;
-  if (!geminiAi) {
-    try {
-      geminiAi = new GoogleGenAI({
-        apiKey: process.env.GEMINI_API_KEY,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build'
-          }
-        }
-      });
-    } catch (e) {
-      console.warn('[Gemini Client] Notice:', e);
-    }
+// Cached list of installed Ollama models to prevent model-not-found 404s
+let cachedOllamaModels: { names: string[]; timestamp: number } | null = null;
+async function getInstalledOllamaModels(ollamaUrl: string): Promise<string[]> {
+  const now = Date.now();
+  if (cachedOllamaModels && now - cachedOllamaModels.timestamp < 30000) {
+    return cachedOllamaModels.names;
   }
-  return geminiAi;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 3000);
+    const res = await fetch(`${ollamaUrl}/api/tags`, { signal: ctrl.signal });
+    clearTimeout(t);
+    if (res.ok) {
+      const data: any = await res.json();
+      if (data && Array.isArray(data.models)) {
+        const names = data.models.map((m: any) => m.name || m.model).filter(Boolean);
+        cachedOllamaModels = { names, timestamp: now };
+        return names;
+      }
+    }
+  } catch (e) {}
+  return [];
 }
 
-// Universal dual-engine LLM runner (Ollama primary: Gemma/LLaMA, Gemini Flash fallback)
-async function queryLlm(prompt: string, modelOverride?: string, formatJson: boolean = true): Promise<string | null> {
-  const ollamaUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
-  const targetModel = modelOverride || appSettings.llamaInterpreterModel || 'llama3';
+// Universal Local LLM runner (Ollama primary with auto-detection of configured/installed models)
+async function queryLlm(prompt: string, modelOverride?: string, formatJson: boolean = true, timeoutMs: number = 55000): Promise<string | null> {
+  const rawUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
+  const ollamaUrl = rawUrl.trim().replace(/\/+$/, '');
 
-  // 1. Try Local Ollama (Gemma or LLaMA)
+  // Determine requested model based on priority: explicit override > interpreter > hypothesis > general
+  let targetModel = (modelOverride ||
+    appSettings.llamaInterpreterModel ||
+    appSettings.llamaModel ||
+    appSettings.grammarHypothesisModel ||
+    appSettings.gemmaModel ||
+    'llama3').trim();
+
+  // Try Local Ollama strictly using the configured/installed model
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 12000);
-    const res = await fetch(`${ollamaUrl}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: targetModel,
-        prompt: prompt,
-        stream: false,
-        format: formatJson ? 'json' : undefined
-      })
-    });
-    clearTimeout(timeoutId);
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.response) {
-        return data.response;
+    // Check if targetModel is installed or pick the installed local model
+    const installed = await getInstalledOllamaModels(ollamaUrl);
+    if (installed.length > 0) {
+      const matched = installed.find(m => m === targetModel || m.startsWith(targetModel + ':') || targetModel.startsWith(m.split(':')[0]));
+      if (matched) {
+        targetModel = matched;
+      } else {
+        // Fallback to the user's primary installed model in Ollama
+        console.log(`[Local LLM] Configured model '${targetModel}' not in Ollama. Using installed local model '${installed[0]}'.`);
+        targetModel = installed[0];
       }
+    }
+
+    // Try /api/generate
+    let responseText: string | null = null;
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await fetch(`${ollamaUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: targetModel,
+          prompt: prompt,
+          stream: false,
+          format: formatJson ? 'json' : undefined
+        })
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && typeof data.response === 'string' && data.response.trim()) {
+          responseText = data.response;
+        }
+      } else if (formatJson && (res.status === 400 || res.status === 500)) {
+        // Model or Ollama version may not support format: 'json'. Retry without format: 'json'.
+        const retryCtrl = new AbortController();
+        const retryTimeout = setTimeout(() => retryCtrl.abort(), timeoutMs);
+        const retryRes = await fetch(`${ollamaUrl}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: retryCtrl.signal,
+          body: JSON.stringify({
+            model: targetModel,
+            prompt: prompt,
+            stream: false
+          })
+        });
+        clearTimeout(retryTimeout);
+        if (retryRes.ok) {
+          const retryData = await retryRes.json();
+          if (retryData && typeof retryData.response === 'string' && retryData.response.trim()) {
+            responseText = retryData.response;
+          }
+        }
+      }
+    } catch (generateErr: any) {
+      // Generate failed; try chat endpoint below
+    }
+
+    // If /api/generate did not produce a response, try /api/chat
+    if (!responseText) {
+      try {
+        const chatCtrl = new AbortController();
+        const chatTimeout = setTimeout(() => chatCtrl.abort(), timeoutMs);
+        const chatRes = await fetch(`${ollamaUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: chatCtrl.signal,
+          body: JSON.stringify({
+            model: targetModel,
+            messages: [{ role: 'user', content: prompt }],
+            stream: false,
+            format: formatJson ? 'json' : undefined
+          })
+        });
+        clearTimeout(chatTimeout);
+        if (chatRes.ok) {
+          const chatData = await chatRes.json();
+          if (chatData?.message?.content && typeof chatData.message.content === 'string') {
+            responseText = chatData.message.content;
+          }
+        }
+      } catch (chatErr) {}
+    }
+
+    if (responseText && responseText.trim()) {
+      return responseText.trim();
     }
   } catch (ollamaErr: any) {
-    // Ollama not running or timed out; smoothly fall back
-  }
-
-  // 2. Try Server-Side Gemini API Fallback (gemini-3.8-flash)
-  const client = getGeminiClient();
-  if (client) {
-    try {
-      const response = await client.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: prompt,
-        config: formatJson ? { responseMimeType: 'application/json' } : {}
-      });
-      if (response && response.text) {
-        return response.text;
-      }
-    } catch (geminiErr: any) {
-      console.warn('[Gemini AI Fallback] Notice:', geminiErr.message || geminiErr);
-    }
+    console.warn(`[Local LLM] Ollama call to ${ollamaUrl} failed:`, ollamaErr.message || ollamaErr);
   }
 
   return null;
@@ -1577,16 +1643,24 @@ app.post('/api/cross-reference/test-interpret', async (req, res) => {
   if (!text) return res.json({ candidates: [], confidence: 0, matchedEntries: [] });
 
   // Same deterministic decode the live interpreter uses, so the tester can't disagree with it.
+  const lexicon = buildLexicon(dictionaryData, crossReferenceData);
   const decoded = decodeUtterance(text, {
-    lexicon: buildLexicon(dictionaryData, crossReferenceData),
+    lexicon,
     rules: grammarRulebook
   });
+  const acoustic = resolveAcousticPhonetics(text, {
+    lexicon,
+    rules: grammarRulebook,
+    trainingData
+  });
+  const effectiveDraft = decoded.coverage > 0 ? decoded.decoded : acoustic.decoded;
+  const effectiveCoverage = decoded.coverage > 0 ? decoded.coverage : acoustic.coverage;
   const matchedEntries = decoded.matchedEntries.map(e => ({ phonetic: e.word, meaning: e.definition, type: e.type || 'word' }));
 
   const promptText = buildInterpreterPrompt({
     heard: text,
-    draft: decoded.decoded,
-    coverage: decoded.coverage,
+    draft: effectiveDraft,
+    coverage: effectiveCoverage,
     rules: grammarRulebook.filter(isRuleActive),
     entries: decoded.matchedEntries,
     verifiedPairs: verifiedPairsFor(text)
@@ -1604,20 +1678,21 @@ app.post('/api/cross-reference/test-interpret', async (req, res) => {
       const parsed = JSON.parse(clean);
       if (parsed && Array.isArray(parsed.candidates)) {
         candidates = sanitizeCandidates(parsed.candidates);
-        const merged = applyDraftToCandidates(candidates, decoded.decoded, decoded.matchedEntries, decoded.coverage, introducedWords(decoded.appliedRules));
+        const merged = applyDraftToCandidates(candidates, effectiveDraft, decoded.matchedEntries, effectiveCoverage, introducedWords(decoded.appliedRules));
         candidates = merged.candidates;
         const reported = typeof parsed.confidence === 'number' ? parsed.confidence : (candidates[0]?.probability ?? 0);
-        confidence = Math.min(reported, evidenceCeiling(decoded.coverage));
-        if (merged.violated.length > 0) confidence = Math.min(confidence, fallbackConfidence(decoded.coverage));
+        confidence = Math.min(reported, evidenceCeiling(effectiveCoverage));
+        if (merged.violated.length > 0) confidence = Math.min(confidence, fallbackConfidence(effectiveCoverage));
       }
     }
   } catch(e) {}
 
   if (candidates.length === 0) {
-    confidence = fallbackConfidence(decoded.coverage);
+    confidence = decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : acoustic.confidence;
     candidates = sanitizeCandidates([
-      { text: decoded.coverage > 0 ? decoded.decoded : polish(text), probability: confidence },
-      { text: polish(text), probability: 0.05 }
+      { text: effectiveDraft, probability: confidence },
+      ...(acoustic.candidates.slice(1).map(c => ({ text: c.text, probability: c.probability }))),
+      { text: polish(effectiveDraft), probability: 0.05 }
     ]);
   }
 
@@ -1670,6 +1745,48 @@ const HYPOTHESIS_TEMPLATES: Record<string, { hypothesis: string; condition: stri
     action: "Restore elided terminal stop ('nee' -> 'need', 'goo' -> 'good')",
     confidence: 0.95
   },
+  coda_truncation_general: {
+    hypothesis: "Paxton elides terminal plosives and consonants in high-frequency content words ('foo' -> 'food', 'ha' -> 'have', 'wan' -> 'want') to ease phonetic articulation.",
+    condition: "Spoken word ending in open vowel where intended meaning requires final consonant ('foo' -> 'food', 'ha' -> 'have')",
+    action: "Restore missing terminal consonant in content word ('foo' -> 'food', 'ha' -> 'have', 'wan' -> 'want')",
+    confidence: 0.94
+  },
+  sibilant_deaffrication: {
+    hypothesis: "Paxton deaffricates postalveolar affricates (/tʃ/) into fricatives (/ʃ/) ('lunsh' -> 'lunch', 'shursh' -> 'church') to reduce oral-motor tension.",
+    condition: "Spoken word containing 'sh' where standard English requires affricate 'ch'",
+    action: "Restore affricate 'ch' ('lunsh' -> 'lunch', 'shursh' -> 'church')",
+    confidence: 0.95
+  },
+  copula_omission: {
+    hypothesis: "Paxton exhibits zero copula syntax when linking subject pronoun 'I' with predicate state adjectives ('I hunry' -> 'I am hungry', 'I tired' -> 'I am tired').",
+    condition: "Pronoun 'I' directly preceding predicate adjective ('hunry', 'hungry', 'tired')",
+    action: "Insert inflected present-tense copula ('I am' or \"I'm\")",
+    confidence: 0.93
+  },
+  liquid_gliding: {
+    hypothesis: "Liquid consonants /l/ and /r/ undergo phonological gliding to glide /w/ or palatal approximant ('wike' -> 'like', 'yeyo' -> 'yellow').",
+    condition: "Spoken word-initial glide 'w' substituting for liquid /l/",
+    action: "Restore initial liquid consonant ('wike' -> 'like', 'yeyo' -> 'yellow')",
+    confidence: 0.94
+  },
+  neg_auxiliary_reduction: {
+    hypothesis: "Negative clauses are formulated with preverbal negation particle 'no' directly preceding base verbs ('no ha' -> \"didn't have\" or \"don't have\").",
+    condition: "Spoken negation 'no' directly preceding lexical verb ('no ha', 'no wan')",
+    action: "Translate as standard inflected negative auxiliary (\"didn't have\", \"don't have\")",
+    confidence: 0.92
+  },
+  cluster_reduction: {
+    hypothesis: "Consonant clusters in onsets and compound words are simplified into single consonants ('ba-man' -> 'Batman', 'tuck' -> 'stuck', 'pay' -> 'play').",
+    condition: "Onset or medial consonant cluster simplified into single consonant",
+    action: "Restore full consonant cluster ('ba-man' -> 'Batman', 'pay' -> 'play')",
+    confidence: 0.95
+  },
+  velar_fronting: {
+    hypothesis: "Velar plosives (/k/, /g/) are produced as anterior alveolar stops (/t/, /d/) due to tongue positioning easing ('tat' -> 'cat', 'do' -> 'go').",
+    condition: "Spoken alveolar stop replacing target velar plosive",
+    action: "Fronting restoration to velar plosive ('tat' -> 'cat', 'do' -> 'go')",
+    confidence: 0.92
+  },
   th_stopping: {
     hypothesis: "Voiced interdental fricative /ð/ is systematically stopped to voiced alveolar plosive /d/ ('dis' for 'this', 'dat' for 'that'), and interrogative coda /t/ is deleted ('wa' for 'what').",
     condition: "Spoken 'dis', 'dat', 'wa is dis'",
@@ -1690,13 +1807,121 @@ const HYPOTHESIS_TEMPLATES: Record<string, { hypothesis: string; condition: stri
   }
 };
 
-const HYPOTHESIS_PATTERNS: { key: string; name: string; patternType: string }[] = [
+interface HypothesisPatternItem {
+  key: string;
+  name: string;
+  patternType: string;
+  customChecks?: PatternCheck[];
+  template?: { hypothesis: string; condition: string; action: string; confidence: number };
+}
+
+const BASE_HYPOTHESIS_PATTERNS: HypothesisPatternItem[] = [
   { key: 'intrusive_a', name: 'Intrusive Indefinite Article "a" before Mass Nouns & Actions', patternType: 'intrusive_article' },
   { key: 'coda_deletion', name: 'Terminal Alveolar Plosive /d/ and /t/ Deletion (Coda Truncation)', patternType: 'consonant_deletion' },
+  { key: 'coda_truncation_general', name: 'Terminal Stop Deletion in Common Content Words ("foo" -> "food", "ha" -> "have")', patternType: 'consonant_deletion' },
+  { key: 'sibilant_deaffrication', name: 'Sibilant and Affricate Simplification (/tʃ/ -> /ʃ/ as in "lunsh" -> "lunch")', patternType: 'consonant_deletion' },
+  { key: 'copula_omission', name: 'Zero Copula Ellipsis in Predicative Adjectives ("I hunry" -> "I am hungry")', patternType: 'grammar_syntax' },
+  { key: 'liquid_gliding', name: 'Liquid Gliding /l/ and /r/ -> /w/ ("wike" -> "like", "yeyo" -> "yellow")', patternType: 'consonant_deletion' },
+  { key: 'neg_auxiliary_reduction', name: 'Negative Auxiliary Substitution ("no ha" -> "didn\'t have / don\'t have")', patternType: 'word_merging' },
   { key: 'th_stopping', name: 'Interdental Fricative Stopping (/ð/ -> /d/ in demonstratives)', patternType: 'consonant_deletion' },
+  { key: 'cluster_reduction', name: 'Consonant Cluster Simplification ("pay" -> "play", "seep" -> "sleep")', patternType: 'consonant_deletion' },
+  { key: 'velar_fronting', name: 'Velar Stop Fronting (/k/ -> /t/, /g/ -> /d/)', patternType: 'consonant_deletion' },
   { key: 'dussin', name: 'Negative Auxiliary Contraction Reduction ("dussin" -> "doesn\'t")', patternType: 'word_merging' },
   { key: 'baman', name: 'Medial Cluster Glottalization in Compound Entities ("ba-man" -> "Batman")', patternType: 'word_merging' }
 ];
+
+// Dynamically mined candidate patterns discovered directly from Paxton's training dataset
+const dynamicDiscoveredPatterns: HypothesisPatternItem[] = [];
+
+// Track tested keys to prevent running the exact same patterns over and over
+const testedPatternKeys: Set<string> = new Set();
+
+/**
+ * Mines unexplained phonetic speech transformations directly from verified pairs in trainingData
+ * so the hypothesis engine autonomously discovers NEW candidate rules from real data.
+ */
+async function mineCandidatePatternFromDataset(pairs: any[], targetModel: string): Promise<HypothesisPatternItem | null> {
+  if (!pairs || pairs.length === 0) return null;
+
+  const discrepancyMap = new Map<string, { count: number; src: string; dst: string; examples: { sound: string; meaning: string }[] }>();
+
+  for (const pair of pairs) {
+    const s = String(pair?.sound || '').trim().toLowerCase();
+    const m = String(pair?.meaning || '').trim().toLowerCase();
+    if (!s || !m || s === m) continue;
+
+    const sTokens = s.split(/\s+/);
+    const mTokens = m.split(/\s+/);
+
+    for (const st of sTokens) {
+      const cleanS = st.replace(/[^a-z0-9-]/g, '');
+      if (!cleanS || cleanS.length < 2) continue;
+
+      // Skip common English function words
+      if (/^(i|you|he|she|it|we|they|a|the|is|am|are|in|on|at|and|to|my|no)$/.test(cleanS)) continue;
+
+      // Skip tokens already covered by confirmed rules in grammarRulebook
+      const alreadyCovered = grammarRulebook.some(r => r.status === 'confirmed' && (r.match === cleanS || (r.patternKey && PATTERN_CHECKS[r.patternKey]?.some(c => c.trigger.test(cleanS)))));
+      if (alreadyCovered) continue;
+
+      for (const mt of mTokens) {
+        const cleanM = mt.replace(/[^a-z0-9-]/g, '');
+        if (!cleanM || cleanS === cleanM) continue;
+
+        // Candidate token mutation pair
+        const pairKey = `${cleanS}->${cleanM}`;
+        if (!discrepancyMap.has(pairKey)) {
+          discrepancyMap.set(pairKey, { count: 0, src: cleanS, dst: cleanM, examples: [] });
+        }
+        const entry = discrepancyMap.get(pairKey)!;
+        entry.count++;
+        if (entry.examples.length < 5) entry.examples.push({ sound: pair.sound, meaning: pair.meaning });
+      }
+    }
+  }
+
+  // Look for candidates: prioritize those across 2+ pairs, then fall back to single clear mutations
+  const candidateEntries = [...discrepancyMap.values()]
+    .filter(e => e.count >= 1)
+    .sort((a, b) => b.count - a.count);
+
+  for (const entry of candidateEntries) {
+    const dynamicKey = `dyn_${entry.src}_${entry.dst}`.replace(/[^a-z0-9_]/g, '_');
+
+    // Skip if already registered
+    if (dynamicDiscoveredPatterns.some(p => p.key === dynamicKey) || BASE_HYPOTHESIS_PATTERNS.some(p => p.key === dynamicKey)) {
+      continue;
+    }
+
+    const triggerRe = new RegExp(`\\b${escapeRegExp(entry.src)}\\b`, 'i');
+    const expectRe = new RegExp(`\\b${escapeRegExp(entry.dst)}\\b`, 'i');
+    const ruleName = `Phonetic Transformation ("${entry.src}" -> "${entry.dst}")`;
+
+    const minedItem: HypothesisPatternItem = {
+      key: dynamicKey,
+      name: ruleName,
+      patternType: 'consonant_deletion',
+      customChecks: [
+        {
+          trigger: triggerRe,
+          expect: expectRe,
+          note: `'${entry.src}' -> '${entry.dst}'`
+        }
+      ],
+      template: {
+        hypothesis: `Paxton consistently articulates '${entry.src}' where target English requires '${entry.dst}', reflecting systematic phonological shift across speech contexts.`,
+        condition: `Spoken occurrence of token '${entry.src}'`,
+        action: `Translate phonetic token '${entry.src}' to intended '${entry.dst}'`,
+        confidence: 0.90
+      }
+    };
+
+    dynamicDiscoveredPatterns.push(minedItem);
+    return minedItem;
+  }
+
+  return null;
+}
 
 async function runHypothesisCycle(): Promise<any> {
   if (trainingData.length === 0) {
@@ -1711,8 +1936,37 @@ async function runHypothesisCycle(): Promise<any> {
     hypothesisCycleStatus.stepDescription = `Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning library of ${trainingData.length} phonetic speech pairs...`;
     pushHypothesisLog(`Cycle #${hypothesisCycleStatus.cycleNumber}: Scanning phonetic library (${trainingData.length} pairs)...`);
 
-    const target = HYPOTHESIS_PATTERNS[(hypothesisCycleStatus.cycleNumber - 1) % HYPOTHESIS_PATTERNS.length];
-    const template = HYPOTHESIS_TEMPLATES[target.key];
+    const targetModel = appSettings.grammarHypothesisModel || appSettings.gemmaModel || 'gemma2';
+
+    // 1. Autonomously mine fresh linguistic candidates from Paxton's training library
+    const newlyMined = await mineCandidatePatternFromDataset(trainingData, targetModel);
+    if (newlyMined) {
+      pushHypothesisLog(`Step 1B: Discovered new linguistic pattern from library: "${newlyMined.name}"`);
+    }
+
+    // Merge base patterns and dynamic discovered patterns
+    let allAvailable = [...BASE_HYPOTHESIS_PATTERNS, ...dynamicDiscoveredPatterns];
+
+    // Check if all available patterns have been visited; if so, refresh the pool to re-verify
+    const unvisited = allAvailable.filter(p => !testedPatternKeys.has(p.key));
+    if (unvisited.length === 0) {
+      testedPatternKeys.clear();
+      pushHypothesisLog(`Step 1B: All ${allAvailable.length} patterns scanned. Cycling through library with updated evidence.`);
+    }
+
+    // Pick target pattern: prioritize unvisited candidates to explore new hypotheses first
+    const candidatePool = allAvailable.filter(p => !testedPatternKeys.has(p.key));
+    const target = candidatePool.length > 0
+      ? candidatePool[0]
+      : allAvailable[(hypothesisCycleStatus.cycleNumber - 1) % allAvailable.length];
+    testedPatternKeys.add(target.key);
+
+    const template = target.template || HYPOTHESIS_TEMPLATES[target.key] || {
+      hypothesis: `Paxton systematically produces phonetic pattern "${target.name}".`,
+      condition: `Spoken occurrence of ${target.name}`,
+      action: `Apply linguistic restoration rule for ${target.name}`,
+      confidence: 0.90
+    };
 
     hypothesisCycleStatus.currentStep = 'isolating_pattern';
     hypothesisCycleStatus.activePattern = target.name;
@@ -1721,14 +1975,13 @@ async function runHypothesisCycle(): Promise<any> {
 
     // Evidence first. It is deterministic and instant, so the model can be briefed with real examples,
     // and skipped entirely when there is nothing to explain.
-    const { supported: supportedExamples, counter: counterExamples } = evaluatePattern(target.key, trainingData);
+    const { supported: supportedExamples, counter: counterExamples } = evaluatePattern(target.key, trainingData, target.customChecks);
     const totalEvaluated = supportedExamples.length + counterExamples.length;
     const accuracy = totalEvaluated > 0 ? supportedExamples.length / totalEvaluated : 0;
     const minSupport = appSettings.hypothesisMinSupport || 2;
     const minConfidence = appSettings.hypothesisMinConfidence || 0.70;
 
     // Step 3: the model explains WHY, using only the evidence above.
-    const targetModel = appSettings.grammarHypothesisModel || appSettings.gemmaModel || 'gemma2';
     hypothesisCycleStatus.currentStep = 'formulating_hypothesis';
     let llmRule: any = null;
     if (totalEvaluated > 0) {
@@ -1738,7 +1991,8 @@ async function runHypothesisCycle(): Promise<any> {
         const rawRes = await queryLlm(
           buildHypothesisPrompt({ patternName: target.name, patternKey: target.key, supported: supportedExamples, counter: counterExamples }),
           targetModel,
-          true
+          true,
+          65000
         );
         if (rawRes) {
           let clean = rawRes.trim();
@@ -3493,6 +3747,13 @@ class LlamaInterpreter {
     const activeConfirmedRules = grammarRulebook.filter(isRuleActive);
     const decoded = decodeUtterance(textTrim, { lexicon, rules: grammarRulebook });
 
+    // Phonetic acoustic resolver for atypical speech patterns
+    const acoustic = resolveAcousticPhonetics(textTrim, {
+      lexicon,
+      rules: grammarRulebook,
+      trainingData
+    });
+
     // A user-verified utterance (same words, ignoring case/punctuation) beats any model guess.
     const exactKey = lexKey(textTrim);
     const exactPairs = trainingData.filter(t => t.sound && t.meaning && lexKey(t.sound) === exactKey);
@@ -3515,17 +3776,17 @@ class LlamaInterpreter {
     // ───────────────────────────────────────────────────────────
     // PHASE 1B: Mini LLM initial assumption (skipped when a verified pair exists)
     // ───────────────────────────────────────────────────────────
-    let miniLlmAssumption = exactMeanings[0] || decoded.decoded;
+    let miniLlmAssumption = exactMeanings[0] || (decoded.coverage > 0 ? decoded.decoded : acoustic.decoded);
     const miniModel = appSettings.miniLlmModel || 'gemma2:2b';
-    // The small first-guess model is planned for later. Until it is switched on, Phase 1B simply reports the
-    // dictionary/rulebook draft as the first assumption and makes no model call.
+    // The small first-guess model is planned for later. Until it is switched on, Phase 1B reports the
+    // acoustic/dictionary draft as the first assumption.
     const miniLlmEnabled = appSettings.miniLlmEnabled === true;
 
     if (exactMeanings.length === 0 && miniLlmEnabled) {
       try {
         const miniPrompt = `You are a specialized lightweight AAC edge model trained on Paxton's phonetic speech.
 Phonetic input: "${text}"
-Dictionary/rule-based draft: "${decoded.decoded}"
+Dictionary/rule-based draft: "${decoded.coverage > 0 ? decoded.decoded : acoustic.decoded}"
 Matched Training Pairs: ${JSON.stringify(relatedPairs.map(p => ({ sound: p.sound, meaning: p.meaning })))}
 
 Output in 1 short phrase: What is your initial 1st-pass translation assumption of what Paxton means?`;
@@ -3545,16 +3806,18 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
       initialAssumption: miniLlmAssumption,
       miniModelUsed: exactMeanings.length > 0
         ? 'verified training pair (no model needed)'
-        : miniLlmEnabled ? `${miniModel} (Fine-Tuned Mini LLM)` : 'not enabled yet (planned); using dictionary + rulebook draft',
+        : miniLlmEnabled ? `${miniModel} (Fine-Tuned Mini LLM)` : (decoded.coverage > 0 ? 'dictionary + rulebook draft' : 'phonetic acoustic resolver'),
       learnedPairsMatched: relatedPairs.map(p => ({ sound: p.sound, meaning: p.meaning })),
       confidence: exactMeanings.length > 0
         ? 0.94
-        : miniLlmEnabled ? 0.76 : (decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : 0.3),
+        : miniLlmEnabled ? 0.76 : (decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : acoustic.confidence),
       reasoning: exactMeanings.length > 0
         ? `Matched fine-tuned phonetic memory pair: "${exactPairs[0].sound}" → "${exactMeanings[0]}"`
         : miniLlmEnabled
           ? `1st-pass semantic translation generated by Mini LLM based on Paxton's phonetic speech.`
-          : `The small first-guess model is not switched on yet, so the first assumption is the draft built from the dictionary and grammar rulebook alone.`
+          : (decoded.coverage > 0
+            ? `Draft built from dictionary and grammar rulebook alone.`
+            : `Acoustic speech resolver analyzed phonetic shifts: ${acoustic.explanations.slice(0, 2).join('; ') || 'phonetic sound resolution'}`)
     };
 
     // ───────────────────────────────────────────────────────────
@@ -3566,13 +3829,16 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
         `Known vocabulary: ${decoded.matchedEntries.slice(0, 4).map(e => `"${e.word}" → "${e.definition}"`).join(', ')}`
       );
     }
+    if (identifiedAtypicalFeatures.length === 0 && acoustic.explanations.length > 0) {
+      identifiedAtypicalFeatures.push(...acoustic.explanations.slice(0, 3));
+    }
     if (identifiedAtypicalFeatures.length === 0) {
       identifiedAtypicalFeatures.push("No known rule or dictionary entry matched; relying on model inference");
     }
 
     const phase2 = {
       initialGuess: phase1B.initialAssumption,
-      reasoning: `Phase 1A captured phonetic sound: "${text}". Phase 1B proposed: "${phase1B.initialAssumption}". ${decoded.matchedEntries.length} dictionary entr${decoded.matchedEntries.length === 1 ? 'y' : 'ies'} and ${decoded.appliedRules.length} grammar rule(s) explain ${(decoded.coverage * 100).toFixed(0)}% of the utterance.`,
+      reasoning: `Phase 1A captured phonetic sound: "${text}". Phase 1B proposed: "${phase1B.initialAssumption}". ${decoded.matchedEntries.length} dictionary entr${decoded.matchedEntries.length === 1 ? 'y' : 'ies'} and ${decoded.appliedRules.length} grammar rule(s) explain ${(decoded.coverage * 100).toFixed(0)}% of the utterance.${acoustic.explanations.length > 0 ? ` Acoustic resolver identified: ${acoustic.explanations.slice(0, 3).join(', ')}.` : ''}`,
       identifiedAtypicalFeatures,
       nextStepsPlanned: [
         "Apply Paxton's confirmed Grammar Rulebook",
@@ -3591,26 +3857,30 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
       reason: r.reason
     }));
 
+    const transformedCandidate = decoded.ruleTransformedText !== textTrim
+      ? decoded.ruleTransformedText
+      : (acoustic.decoded !== textTrim ? acoustic.decoded : decoded.ruleTransformedText);
+
     const phase3 = {
       appliedRules,
       searchedRulesCount: activeConfirmedRules.length,
-      ruleTransformedText: decoded.ruleTransformedText,
+      ruleTransformedText: transformedCandidate,
       reasoning: appliedRules.length > 0
         ? `Applied ${appliedRules.length} verified rule(s) from Paxton's Grammar Rulebook: ${appliedRules.map(r => r.ruleName).join(', ')}.`
-        : `Searched ${activeConfirmedRules.length} active grammar rules; no structural mutation triggered.`,
-      newAssumptions: appliedRules.map(r => `${r.ruleName}: "${r.action}"`)
+        : (acoustic.explanations.length > 0 ? `Acoustic analysis resolved: ${acoustic.explanations.join('; ')}` : `Searched ${activeConfirmedRules.length} active grammar rules; no structural mutation triggered.`),
+      newAssumptions: appliedRules.length > 0 ? appliedRules.map(r => `${r.ruleName}: "${r.action}"`) : acoustic.explanations
     };
 
     // ───────────────────────────────────────────────────────────
     // PHASE 4: Dictionary, context, final assumption and confidence
     // ───────────────────────────────────────────────────────────
     const matchedEntries = decoded.matchedEntries;
-    const dictDecoded = decoded.decoded;
+    const effectiveDraft = decoded.coverage > 0 ? decoded.decoded : acoustic.decoded;
 
     const promptText = buildInterpreterPrompt({
       heard: text,
-      draft: dictDecoded,
-      coverage: decoded.coverage,
+      draft: effectiveDraft,
+      coverage: decoded.coverage > 0 ? decoded.coverage : acoustic.coverage,
       rules: activeConfirmedRules,
       entries: matchedEntries,
       verifiedPairs: verifiedPairsFor(textTrim),
@@ -3627,15 +3897,15 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
       // Verified memory: no model call. Several different verified meanings => let the user choose.
       const ambiguous = exactMeanings.length > 1;
       const alts: any[] = exactMeanings.map((m, i) => ({ text: m, probability: ambiguous ? (i === 0 ? 0.5 : 0.3) : 0.96 }));
-      if (!exactMeanings.some(m => m.toLowerCase() === dictDecoded.toLowerCase())) {
-        alts.push({ text: dictDecoded, probability: 0.03 });
+      if (!exactMeanings.some(m => m.toLowerCase() === effectiveDraft.toLowerCase())) {
+        alts.push({ text: effectiveDraft, probability: 0.03 });
       }
       candidates = sanitizeCandidates(alts);
       confidence = ambiguous ? 0.84 : 0.95;
     } else {
       let parsedResult: any = null;
       try {
-        const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true);
+        const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true, 55000);
         if (rawResponse) {
           let cleanText = rawResponse.trim();
           const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
@@ -3651,8 +3921,10 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
         ? sanitizeCandidates(
             parsedResult.candidates.map((c: any) => {
               let txt = String(c?.text ?? '').trim();
-              // The model parroted the raw phonetics: use the rule/dictionary decode instead.
-              if (txt && lexKey(txt) === echo && lexKey(dictDecoded) !== echo) txt = dictDecoded;
+              // If model parroted the raw phonetics, replace with interpreted decode
+              if (txt && lexKey(txt) === echo) {
+                txt = effectiveDraft;
+              }
               return { text: txt, probability: c?.probability };
             })
           )
@@ -3660,12 +3932,9 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
 
       if (llmCandidates.length > 0) {
         llmUsed = true;
-        const llmTopAgrees = lexKey(llmCandidates[0].text) === lexKey(dictDecoded);
+        const llmTopAgrees = lexKey(llmCandidates[0].text) === lexKey(effectiveDraft);
 
-        // The model may complete the sentence, but it may not override his verified dictionary. If its top
-        // answer drops a verified meaning, the dictionary/rule decode takes the lead and the model's answers
-        // become alternatives.
-        const merged = applyDraftToCandidates(llmCandidates, dictDecoded, matchedEntries, decoded.coverage, introducedWords(decoded.appliedRules));
+        const merged = applyDraftToCandidates(llmCandidates, effectiveDraft, matchedEntries, decoded.coverage > 0 ? decoded.coverage : acoustic.coverage, introducedWords(decoded.appliedRules));
         candidates = merged.candidates;
         draftOverrodeModel = merged.violated.length > 0;
         if (draftOverrodeModel) {
@@ -3676,35 +3945,39 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
           ? parsedResult.confidence
           : candidates[0].probability;
         confidence = Math.min(0.98, Math.max(0.4, reported));
-        // Never let an unsupported model guess outrun the evidence...
-        confidence = Math.min(confidence, evidenceCeiling(decoded.coverage));
-        // ...but when the model independently agrees with the dictionary/rule decode, trust the decode's coverage.
-        if (llmTopAgrees && decoded.coverage > 0) {
-          confidence = Math.max(confidence, fallbackConfidence(decoded.coverage));
+        confidence = Math.min(confidence, evidenceCeiling(decoded.coverage > 0 ? decoded.coverage : acoustic.coverage));
+        if (llmTopAgrees && (decoded.coverage > 0 || acoustic.coverage > 0)) {
+          confidence = Math.max(confidence, decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : acoustic.confidence);
         }
-        // A model that contradicted the dictionary is never auto-spoken: he (or his carer) confirms first.
         if (draftOverrodeModel) {
           confidence = Math.min(fallbackConfidence(decoded.coverage), AUTO_ACCEPT_CONFIDENCE - 0.01);
         }
       } else {
-        // Offline fallback: dictionary + rulebook only.
-        const candidateA = decoded.coverage > 0 ? dictDecoded : polish(textTrim);
+        // High-intelligence Local Phonetic Resolver fallback
+        const candidateA = decoded.coverage > 0 ? decoded.decoded : acoustic.decoded;
         const alts: { text: string; probability: number }[] = [];
 
-        const wantVariant = candidateA.replace(/\bneed\b/i, 'want');
-        if (wantVariant !== candidateA) alts.push({ text: wantVariant, probability: 0.1 });
+        // Include alternative readings from acoustic resolver
+        for (const ac of acoustic.candidates.slice(1)) {
+          alts.push({ text: ac.text, probability: ac.probability });
+        }
 
-        // Ambiguous dictionary entries ("what / water") become alternative candidates.
+        const wantVariant = candidateA.replace(/\bneed\b/i, 'want');
+        if (wantVariant !== candidateA && !alts.some(a => a.text === wantVariant)) {
+          alts.push({ text: wantVariant, probability: 0.1 });
+        }
+
         for (const e of matchedEntries) {
           const primary = primaryMeaning(e.definition);
           for (const alt of alternativeMeanings(e.definition)) {
             const swapped = candidateA.replace(new RegExp(`\\b${escapeRegExp(primary)}\\b`, 'i'), alt);
-            if (swapped !== candidateA) alts.push({ text: polish(swapped), probability: 0.1 });
+            if (swapped !== candidateA && !alts.some(a => a.text === polish(swapped))) {
+              alts.push({ text: polish(swapped), probability: 0.1 });
+            }
           }
         }
-        alts.push({ text: polish(textTrim), probability: 0.04 });
 
-        confidence = fallbackConfidence(decoded.coverage);
+        confidence = decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : acoustic.confidence;
         candidates = sanitizeCandidates([{ text: candidateA, probability: confidence }, ...alts]);
       }
     }
@@ -3713,6 +3986,9 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
     const mode = routeConfidence(confidence, threshold);
     const didYouMeanPrompt = candidates[0]?.text || '';
     const usage = summarizeUsage({ verifiedPair: exactMeanings.length > 0, llmUsed, decoded, draftOverrodeModel });
+    if (usage.coverage === 0 && acoustic.coverage > 0) {
+      usage.coverage = Math.round(acoustic.coverage * 1000) / 1000;
+    }
 
     const phase4 = {
       matchedDictionaryEntries: matchedEntries.map(m => ({ word: m.word, definition: m.definition, type: m.type })),

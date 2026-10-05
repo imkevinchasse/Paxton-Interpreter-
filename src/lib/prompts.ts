@@ -147,7 +147,7 @@ export function buildHypothesisPrompt(input: HypothesisPromptInput): string {
           .join('\n')
       : '- (none)';
 
-  return `You are a speech-language pathologist studying the speech of a child named Paxton, who has Down syndrome. You are writing one entry for the rulebook his interpreter app uses to decode him.
+  return `You are a clinical speech-language pathologist analyzing atypical speech patterns and motor-speech delays (such as childhood apraxia, dysarthria, oral hypotonia, phonological delays, and morphosyntactic framing). You are writing one empirical entry for the rulebook his interpreter app uses to decode him.
 
 PATTERN UNDER TEST: ${input.patternName}  [${input.patternKey}]
 
@@ -157,14 +157,46 @@ ${lines(input.supported, 8)}
 Pairs that contradict it or mark its boundary (${input.counter.length}):
 ${lines(input.counter, 6)}
 
-Write the entry using ONLY this evidence. Do not claim anything about examples that are not listed above, and do not mention research or other children.
-- "hypothesis": two or three plain sentences on what the pattern is and the likely phonological reason.
+Write the entry using ONLY this evidence. Focus on the articulatory, phonological, or morphosyntactic "why" (e.g., oral-motor easing, syllable simplification, open-syllable bias, stop plosive ease over frication, copula ellipsis) without labeling diagnostic deficits:
+- "hypothesis": two or three clinically precise sentences explaining what the abnormal pattern is and the physical/phonological why.
 - "condition": when the rule applies AND when it must not (use the contradicting pairs for the boundary).
 - "action": one short imperative sentence the interpreter can follow.
 - "confidence": 0 to 1, how strongly these examples support the pattern. Lower it when there are few examples or any contradiction.
 
 Reply with JSON only, no other text:
 {"hypothesis":"...","condition":"...","action":"...","confidence":0.0}`;
+}
+
+export interface AutonomousDiscoveryPromptInput {
+  pairs: { sound: string; meaning: string }[];
+  existingRuleNames: string[];
+}
+
+export function buildAutonomousDiscoveryPrompt(input: AutonomousDiscoveryPromptInput): string {
+  const samplePairs = input.pairs.slice(0, 30).map((p, idx) => `${idx + 1}. Spoken: "${p.sound}" -> Intended: "${p.meaning}"`).join('\n');
+  return `You are an expert computational clinical linguist and speech-language pathologist inspecting a corpus of atypical speech pairs from an individual with speech motor differences (apraxia, dysarthria, phonological delay, morphosyntactic differences).
+
+Analyze this empirical corpus of verified spoken-to-intended pairs:
+${samplePairs}
+
+Existing known rules (do not duplicate these):
+${input.existingRuleNames.map(r => `- ${r}`).join('\n')}
+
+Identify ONE novel, clinically sound abnormal speech or grammar pattern evident across these examples that is not yet covered.
+Focus on standard clinical phonological & motor speech processes (e.g. final consonant deletion, cluster reduction, stopping, fronting, liquid gliding, deaffrication, weak syllable deletion, intrusive articles, zero copula syntax, negative particle substitution, assimilation).
+
+Reply with JSON only, strictly in this schema:
+{
+  "patternKey": "snake_case_clinical_key",
+  "ruleName": "Clinical Pattern Name (e.g., Alveolar Plosive Coda Deletion)",
+  "patternType": "consonant_deletion",
+  "triggerWord": "example_spoken_token",
+  "expectWord": "example_intended_word",
+  "hypothesis": "Clinical explanation of the articulatory/phonological process and the mechanical 'why' behind it.",
+  "condition": "Specific context when this substitution or reduction occurs.",
+  "action": "Deterministic translation instruction for the decoder.",
+  "confidence": 0.90
+}`;
 }
 
 // ─────────────────────────────────────────────────────────────

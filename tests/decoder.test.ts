@@ -18,6 +18,7 @@ import {
   sanitizeCandidates,
   summarizeUsage,
   tokenize,
+  resolveAcousticPhonetics,
   type GrammarRuleLike
 } from '../src/lib/decoder';
 
@@ -315,4 +316,29 @@ test('a model answer that ignores what a rule produced loses the top slot', () =
   // harmless rephrasing that keeps the content words is fine
   const ok = sanitizeCandidates([{ text: 'I need that please', probability: 0.9 }]);
   assert.equal(applyDraftToCandidates(ok, 'I need that', [], 0.6, ['need', 'that']).draftLeads, false);
+});
+
+test('resolveAcousticPhonetics decodes atypical speech phrases without failing to echo raw input', () => {
+  const result = resolveAcousticPhonetics('Iwa foo I hunry. No ha lunsh');
+  assert.ok(result.decoded.toLowerCase().includes('want food'));
+  assert.ok(result.decoded.toLowerCase().includes('hungry'));
+  assert.ok(result.decoded.toLowerCase().includes('lunch'));
+  assert.ok(result.confidence >= 0.70);
+  assert.ok(result.candidates.length >= 2);
+  // Must NOT be the raw phonetic string
+  assert.notEqual(result.decoded.toLowerCase(), 'iwa foo i hunry. no ha lunsh');
+});
+
+test('evaluatePattern supports dynamic custom pattern checks', () => {
+  const customChecks = [
+    { trigger: /\bfoo\b/i, expect: /\bfood\b/i, note: "'foo' -> 'food'" }
+  ];
+  const pairs = [
+    { sound: 'iwa foo', meaning: 'I want food' },
+    { sound: 'foo is goo', meaning: 'food is good' },
+    { sound: 'foo bar', meaning: 'something else' }
+  ];
+  const ev = evaluatePattern('dyn_foo_food', pairs, customChecks);
+  assert.equal(ev.supported.length, 2);
+  assert.equal(ev.counter.length, 1);
 });

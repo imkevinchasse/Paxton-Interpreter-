@@ -163,6 +163,7 @@ export function SettingsView() {
                   placeholder="gemma2"
                 />
                 <datalist id="gemma-models">
+                  <option value="gpt-oss:20b" />
                   <option value="gemma2" />
                   <option value="gemma:7b" />
                   <option value="gemma2:9b" />
@@ -170,7 +171,7 @@ export function SettingsView() {
                   <option value="gemma:2b" />
                   <option value="gemma3" />
                   <option value="llama3" />
-                  <option value="gemini-3.8-flash" />
+                  <option value="mistral" />
                 </datalist>
                 <p className="text-xs text-slate-400 mt-1">
                   Model used to analyze abnormal patterns (e.g. why Paxton dropped &ldquo;d&rdquo; or said &ldquo;a hell&rdquo;), formulate linguistic hypotheses, and test across the corpus.
@@ -178,6 +179,7 @@ export function SettingsView() {
               </div>
               
               <datalist id="ollama-models">
+                <option value="gpt-oss:20b" />
                 <option value="llama3" />
                 <option value="gemma2" />
                 <option value="gemma:7b" />

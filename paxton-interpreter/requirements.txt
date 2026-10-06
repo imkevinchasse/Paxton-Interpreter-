@@ -1,0 +1,20 @@
+# Paxton Interpreter (openai/whisper-large-v3-turbo + LoRA)
+# Optimized for severe speech differences (dysarthria, apraxia, Down syndrome, cerebral palsy)
+
+transformers>=4.48.0
+datasets>=2.19.0
+accelerate>=0.30.0
+peft>=0.11.0
+evaluate>=0.4.2
+jiwer>=3.0.4
+librosa>=0.10.1
+soundfile>=0.12.1
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy>=1.24.0
+scipy>=1.11.0
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
+requests>=2.31.0

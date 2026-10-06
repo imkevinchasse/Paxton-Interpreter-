@@ -1,5 +1,5 @@
 import { type Interaction, type ViewState } from '../types';
-import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart, Sparkles, BookMarked, GitBranch, Library } from 'lucide-react';
+import { Settings, Mic2, Database, Activity, FileAudio, Volume2, Trash2, BookA, LineChart, Sparkles, BookMarked, GitBranch, Library, Zap } from 'lucide-react';
 import React, { useState, useEffect } from 'react';
 
 interface SidebarProps { 
@@ -51,6 +51,23 @@ export function Sidebar({ interactions, currentView, onViewChange, onDelete }: S
             }`}
           >
             <Activity className="w-4 h-4 text-indigo-600" /> Live Interpreter
+          </button>
+
+          <button 
+            onClick={() => onViewChange('simplified_lora')}
+            className={`flex items-center justify-between p-3 rounded-lg text-sm font-medium transition-colors cursor-pointer ${
+              currentView === 'simplified_lora' 
+                ? 'bg-amber-100 text-amber-900 border border-amber-300 font-semibold' 
+                : 'text-slate-600 hover:bg-slate-100 border border-transparent'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <Zap className="w-4 h-4 text-amber-600" />
+              <span>Whisper Turbo LoRA</span>
+            </div>
+            <span className="text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">
+              Simplified
+            </span>
           </button>
 
           <button 

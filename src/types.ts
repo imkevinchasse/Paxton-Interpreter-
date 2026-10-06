@@ -93,6 +93,11 @@ export interface PipelineResult {
   isLowCertainty?: boolean;
   didYouMeanPrompt?: string;
   usage?: InterpretationUsage;
+  isSimplifiedMode?: boolean;
+  rawWhisperTranscript?: string;
+  lightLlmCorrectionApplied?: boolean;
+  correctionReason?: string;
+  audioPairId?: string;
   context: {
     location: string;
     time: string;
@@ -125,6 +130,11 @@ export interface AppSettings {
   trainingLR?: string;
   trainingBatchSize?: number;
   trainingMode?: string;
+  simplifiedMode?: boolean; // Whether the 3-step Whisper-Turbo LoRA pipeline is active
+  whisperTurboModel?: string; // e.g. "openai/whisper-large-v3-turbo"
+  simplifiedConfidenceThreshold?: number; // e.g. 0.82
+  lightLlmCorrectionEnabled?: boolean; // Context-aware light LLM correction when confidence < threshold
+  loraAdapterActive?: boolean;
 }
 
 export interface TrainingItem {
@@ -334,5 +344,5 @@ export interface VersioningState {
   untrainedDatasetDeltaCount: number;
 }
 
-export type ViewState = 'interpreter' | 'training_studio' | 'training' | 'settings' | 'audiobank' | 'dictionary' | 'cross_reference' | 'grammar_rulebook' | 'versioning';
+export type ViewState = 'interpreter' | 'simplified_lora' | 'training_studio' | 'training' | 'settings' | 'audiobank' | 'dictionary' | 'cross_reference' | 'grammar_rulebook' | 'versioning';
 

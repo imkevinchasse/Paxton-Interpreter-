@@ -118,6 +118,7 @@ export interface AppSettings {
   hypothesisMinConfidence?: number;
   lowCertaintyThreshold?: number; // threshold below which "Did you mean ___?" triggers (e.g. 0.78)
   miniLlmModel?: string; // model for Phase 1B initial assumptions (e.g. gemma2:2b, llama3.2:1b)
+  llmTimeoutMs?: number; // how long to wait for a model before using the offline guess
   miniLlmEnabled?: boolean; // Phase 1B small first-guess model. Planned, off by default.
   whisperEndpoint: string;
   speakerIsolationEnabled?: boolean;

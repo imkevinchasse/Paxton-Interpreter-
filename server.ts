@@ -24,6 +24,7 @@ import {
   introducedWords,
   isRuleActive,
   lexKey,
+  PATTERN_CHECKS,
   polish,
   primaryMeaning,
   routeConfidence,
@@ -63,8 +64,62 @@ async function getInstalledOllamaModels(ollamaUrl: string): Promise<string[]> {
   return [];
 }
 
+// What happened on a model call. A silent failure used to look like "the app can't guess"; now the reason
+// (Ollama not running, still loading, model not installed ...) is recorded and shown to the user.
+interface LlmTrace {
+  ollama: string;
+  ok: boolean;
+  via: 'ollama' | null;
+  /** The model actually used (may differ from the configured one when that one is not installed). */
+  model: string;
+  /** Set when the configured model was not installed and another one was substituted. */
+  note: string;
+  ms: number;
+}
+
+function newLlmTrace(model = ''): LlmTrace {
+  return { ollama: 'not tried', ok: false, via: null, model, note: '', ms: 0 };
+}
+
+/** A model that is still loading can take a while the first time, so be patient before giving up. */
+function llmTimeoutMs(): number {
+  const t = Number(appSettings.llmTimeoutMs);
+  return isFinite(t) && t >= 2000 ? t : 55000;
+}
+
+async function ollamaPost(
+  url: string,
+  body: any,
+  timeoutMs: number
+): Promise<{ ok: boolean; status: number; data: any; error?: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify(body)
+    });
+    let data: any = null;
+    try { data = await res.json(); } catch {}
+    return { ok: res.ok, status: res.status, data };
+  } catch (err: any) {
+    return { ok: false, status: 0, data: null, error: err?.name === 'AbortError' ? 'timeout' : String(err?.cause?.code || err?.message || 'unknown error') };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Universal Local LLM runner (Ollama primary with auto-detection of configured/installed models)
-async function queryLlm(prompt: string, modelOverride?: string, formatJson: boolean = true, timeoutMs: number = 55000): Promise<string | null> {
+async function queryLlm(
+  prompt: string,
+  modelOverride?: string,
+  formatJson: boolean = true,
+  timeoutMs: number = llmTimeoutMs(),
+  trace: LlmTrace = newLlmTrace()
+): Promise<string | null> {
+  const started = Date.now();
   const rawUrl = appSettings.ollamaEndpoint || 'http://localhost:11434';
   const ollamaUrl = rawUrl.trim().replace(/\/+$/, '');
 
@@ -75,104 +130,77 @@ async function queryLlm(prompt: string, modelOverride?: string, formatJson: bool
     appSettings.grammarHypothesisModel ||
     appSettings.gemmaModel ||
     'llama3').trim();
+  const configured = targetModel;
+  const done = (text: string | null) => {
+    trace.model = targetModel;
+    trace.ms = Date.now() - started;
+    return text;
+  };
+  const text = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : '');
+  const failure = (r: { status: number; data: any; error?: string }) =>
+    r.error === 'timeout'
+      ? `no answer within ${Math.round(timeoutMs / 1000)}s (a model that is still loading can be slow the first time)`
+      : r.error
+        ? `could not connect to ${ollamaUrl} (${r.error})`
+        : `HTTP ${r.status}${r.data?.error ? ` (${String(r.data.error).slice(0, 120)})` : ''}`;
 
-  // Try Local Ollama strictly using the configured/installed model
-  try {
-    // Check if targetModel is installed or pick the installed local model
-    const installed = await getInstalledOllamaModels(ollamaUrl);
-    if (installed.length > 0) {
-      const matched = installed.find(m => m === targetModel || m.startsWith(targetModel + ':') || targetModel.startsWith(m.split(':')[0]));
-      if (matched) {
-        targetModel = matched;
-      } else {
-        // Fallback to the user's primary installed model in Ollama
-        console.log(`[Local LLM] Configured model '${targetModel}' not in Ollama. Using installed local model '${installed[0]}'.`);
-        targetModel = installed[0];
-      }
+  // Check that the target model is installed, or pick the installed local model
+  const installed = await getInstalledOllamaModels(ollamaUrl);
+  if (installed.length > 0) {
+    const matched = installed.find(m => m === targetModel || m.startsWith(targetModel + ':') || targetModel.startsWith(m.split(':')[0]));
+    if (matched) {
+      targetModel = matched;
+    } else {
+      // Fall back to the user's primary installed model in Ollama
+      console.log(`[Local LLM] Configured model '${targetModel}' not in Ollama. Using installed local model '${installed[0]}'.`);
+      targetModel = installed[0];
+      trace.note = `'${configured}' is not installed in Ollama, so '${targetModel}' was used instead`;
     }
-
-    // Try /api/generate
-    let responseText: string | null = null;
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await fetch(`${ollamaUrl}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          model: targetModel,
-          prompt: prompt,
-          stream: false,
-          format: formatJson ? 'json' : undefined
-        })
-      });
-      clearTimeout(timeoutId);
-      if (res.ok) {
-        const data = await res.json();
-        if (data && typeof data.response === 'string' && data.response.trim()) {
-          responseText = data.response;
-        }
-      } else if (formatJson && (res.status === 400 || res.status === 500)) {
-        // Model or Ollama version may not support format: 'json'. Retry without format: 'json'.
-        const retryCtrl = new AbortController();
-        const retryTimeout = setTimeout(() => retryCtrl.abort(), timeoutMs);
-        const retryRes = await fetch(`${ollamaUrl}/api/generate`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: retryCtrl.signal,
-          body: JSON.stringify({
-            model: targetModel,
-            prompt: prompt,
-            stream: false
-          })
-        });
-        clearTimeout(retryTimeout);
-        if (retryRes.ok) {
-          const retryData = await retryRes.json();
-          if (retryData && typeof retryData.response === 'string' && retryData.response.trim()) {
-            responseText = retryData.response;
-          }
-        }
-      }
-    } catch (generateErr: any) {
-      // Generate failed; try chat endpoint below
-    }
-
-    // If /api/generate did not produce a response, try /api/chat
-    if (!responseText) {
-      try {
-        const chatCtrl = new AbortController();
-        const chatTimeout = setTimeout(() => chatCtrl.abort(), timeoutMs);
-        const chatRes = await fetch(`${ollamaUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: chatCtrl.signal,
-          body: JSON.stringify({
-            model: targetModel,
-            messages: [{ role: 'user', content: prompt }],
-            stream: false,
-            format: formatJson ? 'json' : undefined
-          })
-        });
-        clearTimeout(chatTimeout);
-        if (chatRes.ok) {
-          const chatData = await chatRes.json();
-          if (chatData?.message?.content && typeof chatData.message.content === 'string') {
-            responseText = chatData.message.content;
-          }
-        }
-      } catch (chatErr) {}
-    }
-
-    if (responseText && responseText.trim()) {
-      return responseText.trim();
-    }
-  } catch (ollamaErr: any) {
-    console.warn(`[Local LLM] Ollama call to ${ollamaUrl} failed:`, ollamaErr.message || ollamaErr);
   }
 
-  return null;
+  // /api/generate (keep_alive keeps the model in memory so only the very first phrase pays the load time)
+  const generate = (withFormat: boolean) =>
+    ollamaPost(`${ollamaUrl}/api/generate`, {
+      model: targetModel,
+      prompt,
+      stream: false,
+      keep_alive: '30m',
+      format: withFormat ? 'json' : undefined
+    }, timeoutMs);
+
+  let r = await generate(formatJson);
+  let out = r.ok ? text(r.data?.response) : '';
+  let reason = r.ok ? 'replied with an empty response' : failure(r);
+
+  // The model or Ollama version may not support format: 'json'. Retry without it.
+  if (!out && !r.ok && formatJson && (r.status === 400 || r.status === 500)) {
+    r = await generate(false);
+    out = r.ok ? text(r.data?.response) : '';
+    if (!out) reason = r.ok ? 'replied with an empty response' : failure(r);
+  }
+
+  // If /api/generate did not produce a response but Ollama did answer, try /api/chat. (A refused connection or a
+  // timeout is not fixed by asking again, and a second full wait would just double the delay.)
+  if (!out && r.status !== 0) {
+    const c = await ollamaPost(`${ollamaUrl}/api/chat`, {
+      model: targetModel,
+      messages: [{ role: 'user', content: prompt }],
+      stream: false,
+      keep_alive: '30m',
+      format: formatJson ? 'json' : undefined
+    }, timeoutMs);
+    out = c.ok ? text(c.data?.message?.content) : '';
+  }
+
+  if (!out) {
+    trace.ollama = reason + (r.status === 404 ? `; install it with: ollama pull ${targetModel}` : '');
+    console.warn(`[Local LLM] Ollama call to ${ollamaUrl} failed: ${trace.ollama}`);
+    return done(null);
+  }
+  trace.ollama = 'ok';
+  trace.ok = true;
+  trace.via = 'ollama';
+  return done(out);
 }
 
 // Safe directory resolution compatible with both CommonJS (dist/server.cjs) and ES modules
@@ -212,6 +240,8 @@ let appSettings: any = {
   miniLlmModel: 'gemma2:2b',
   // The small first-guess model is planned but not in use yet. Flip this in settings.json to switch it on later.
   miniLlmEnabled: false,
+  // How long to wait for a model before falling back to the offline guess (a cold model can be slow to load).
+  llmTimeoutMs: 55000,
   hypothesisMinSupport: 2,
   hypothesisMinConfidence: 0.70,
   whisperEndpoint: 'http://localhost:8080',
@@ -842,6 +872,24 @@ app.post('/api/settings', (req, res) => {
   console.log(`--> Dictionary Llama Model: ${appSettings.llamaDictionaryModel}`);
   console.log(`--> Whisper Gateway: ${appSettings.whisperEndpoint}`);
   res.json(appSettings);
+});
+
+// Is a language model actually reachable? Sends a tiny prompt and reports exactly what happened.
+app.get('/api/llm/status', async (req, res) => {
+  const trace = newLlmTrace();
+  const raw = await queryLlm('Reply with exactly this JSON and nothing else: {"ok":true}', undefined, true, llmTimeoutMs(), trace);
+  const installed = await getInstalledOllamaModels((appSettings.ollamaEndpoint || 'http://localhost:11434').trim().replace(/\/+$/, ''));
+  res.json({
+    ok: trace.ok,
+    model: trace.model,
+    ms: trace.ms,
+    ollamaEndpoint: appSettings.ollamaEndpoint,
+    detail: trace.ollama,
+    note: trace.note,
+    installedModels: installed,
+    timeoutSeconds: Math.round(llmTimeoutMs() / 1000),
+    reply: raw ? raw.slice(0, 80) : null
+  });
 });
 
 app.get('/api/dictionary', (req, res) => {

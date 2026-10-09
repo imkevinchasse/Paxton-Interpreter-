@@ -64,6 +64,8 @@ export interface InterpreterPromptInput {
   pastConfirmations?: { heard?: string; confirmed?: string }[];
   /** Time of day etc. Optional flavour only. */
   timeOfDay?: string;
+  /** Offline sound-alike readings of the unexplained words (hints only, may be wrong). */
+  soundAlikes?: string[];
 }
 
 export function buildInterpreterPrompt(input: InterpreterPromptInput): string {
@@ -105,7 +107,7 @@ ${examples}
 ${past ? `\nSENTENCES HE CONFIRMED BEFORE THAT RESEMBLE THIS ONE:\n${past}\n` : ''}
 WHAT WAS HEARD: ${q(input.heard)}
 DRAFT FROM HIS RULES AND DICTIONARY ONLY: ${q(input.draft)}
-The draft explains ${pct}% of the words. Words it did not explain are unchanged and may still be atypical.${input.timeOfDay ? `\nTime of day: ${input.timeOfDay}.` : ''}
+The draft explains ${pct}% of the words. Words it did not explain are unchanged and may still be atypical.${input.timeOfDay ? `\nTime of day: ${input.timeOfDay}.` : ''}${(input.soundAlikes || []).length ? `\nSOUND-ALIKE HINTS FROM A SIMPLE PHONETIC MATCHER (guesses only, they can be wrong; use them when they fit the sentence and ignore them when they do not):\n${(input.soundAlikes || []).slice(0, 3).map(t => `- ${q(t)}`).join('\n')}` : ''}
 
 HOW TO DECIDE (in this order of authority):
 1. A verified example that matches what was heard wins.

@@ -13,6 +13,7 @@
  *   3. Grammar rulebook (confirmed + enabled rules only) on whatever the dictionary did not explain.
  */
 
+import { guessUtterance, personalVocabFrom } from './phonetic';
 import {
   CLINICAL_PATTERNS,
   type ClinicalPatternDefinition
@@ -864,26 +865,23 @@ export interface PhoneticResolution {
   explanations: string[];
 }
 
-const COMMON_PHONETIC_PHRASES: [RegExp, string, string][] = [
-  [/\bwatubah!?\s*(?:i'm\s+nass\s+a\s+)?love\s+you\s+mom\b/gi, "I want talk about I love you mom", "Resolved 'Watubah! ...' -> 'I want talk about I love you mom'"],
-  [/\bwakabah\s+to\s+you\b/gi, "I wan talk to you", "Resolved 'Wakabah to you' -> 'I wan talk to you'"],
-  [/\bam\s+i\s+a\s+black\??\b/gi, "I like mower, black", "Resolved 'Am I a black' -> 'I like mower, black'"],
-  [/\bbest\s+you\s+ah\s+i\s+lost\s+a\s+job\b/gi, "go back to work I lost a job", "Resolved 'best you ah...' -> 'go back to work I lost a job'"],
-  [/\bwah\s+out\s+tobah\b/gi, "ran out toilet paper", "Resolved 'wah out Tobah' -> 'ran out toilet paper'"],
-  [/\bask\s+dussin\s+more\s+tobah\b/gi, "ask Dustin more Toilet paper", "Resolved 'ask dussin more Tobah' -> 'ask Dustin more Toilet paper'"],
-  [/\bfeel\s+mad\s+bad\s+caskon\b/gi, "feel mad black cat's gone", "Resolved 'mad bad caskon' -> \"mad black cat's gone\""],
-  [/\bcassin\s+mya\s+blackwet\s+cats?\b/gi, "Cat my black white cat", "Resolved 'Cassin mya blackwet cats' -> 'Cat my black white cat'"],
-  [/\bi\s+see\s+you\s+some\b/gi, "I like sing, I like sing song", "Resolved 'I see you some' -> 'I like sing, I like sing song'"],
-  [/\bno\s+(?:ha|have)\b/gi, "didn't have", "Resolved 'no ha' -> \"didn't have\""],
-  [/\bno\s+(?:wan|want)\b/gi, "don't want", "Resolved 'no wan' -> \"don't want\""],
-  [/\biwa\s+foo\b/gi, "I want food", "Resolved 'iwa foo' -> 'I want food'"],
-  [/\bi\s+(?:hunry|hungry)\b/gi, "I am hungry", "Copula restoration 'I hunry' -> 'I am hungry'"],
-  [/\bi\s+(?:tired|tire)\b/gi, "I am tired", "Copula restoration 'I tire' -> 'I am tired'"],
-  [/\bi\s+nee\s+a\s+hell\b/gi, "I need some help", "Resolved 'i nee a hell' -> 'I need some help'"],
-  [/\bwa\s+is\s+dis\b/gi, "what is this", "Resolved 'wa is dis' -> 'what is this'"]
+/**
+ * Phrases and words from the family's own notes that no general rule could guess (names, invented words).
+ * Everything else is handled by the general sound-alike guesser in phonetic.ts, not by word lists.
+ */
+const FAMILY_PHRASES: [RegExp, string, string][] = [
+  [/\bwatubah!?\s*(?:i'm\s+nass\s+a\s+)?love\s+you\s+mom\b/gi, "I want talk about I love you mom", "Family note: 'Watubah ...' -> 'I want talk about I love you mom'"],
+  [/\bwakabah\s+to\s+you\b/gi, "I wan talk to you", "Family note: 'Wakabah to you' -> 'I wan talk to you'"],
+  [/\bam\s+i\s+a\s+black\??\b/gi, "I like mower, black", "Family note: 'Am I a black' -> 'I like mower, black'"],
+  [/\bbest\s+you\s+ah\s+i\s+lost\s+a\s+job\b/gi, "go back to work I lost a job", "Family note: 'best you ah...' -> 'go back to work I lost a job'"],
+  [/\bwah\s+out\s+tobah\b/gi, "ran out toilet paper", "Family note: 'wah out Tobah' -> 'ran out toilet paper'"],
+  [/\bask\s+dussin\s+more\s+tobah\b/gi, "ask Dustin more Toilet paper", "Family note: 'ask dussin more Tobah' -> 'ask Dustin more Toilet paper'"],
+  [/\bfeel\s+mad\s+bad\s+caskon\b/gi, "feel mad black cat's gone", "Family note: 'mad bad caskon' -> \"mad black cat's gone\""],
+  [/\bcassin\s+mya\s+blackwet\s+cats?\b/gi, "Cat my black white cat", "Family note: 'Cassin mya blackwet cats' -> 'Cat my black white cat'"],
+  [/\bi\s+see\s+you\s+some\b/gi, "I like sing, I like sing song", "Family note: 'I see you some' -> 'I like sing, I like sing song'"]
 ];
 
-const COMMON_PHONETIC_WORDS: Record<string, { target: string; note: string }> = {
+const FAMILY_WORDS: Record<string, { target: string; note: string }> = {
   tobah: { target: 'toilet paper', note: "'Tobah' -> 'toilet paper'" },
   watubah: { target: 'I want talk about', note: "'Watubah' -> 'I want talk about'" },
   wakabah: { target: 'I wan talk to', note: "'Wakabah' -> 'I wan talk to'" },
@@ -891,36 +889,16 @@ const COMMON_PHONETIC_WORDS: Record<string, { target: string; note: string }> = 
   cassin: { target: 'Cat', note: "'Cassin' -> 'Cat'" },
   blackwet: { target: 'black white', note: "'blackwet' -> 'black white'" },
   mya: { target: 'my', note: "'mya' -> 'my'" },
-  iwa: { target: 'I want', note: "'iwa' -> 'I want'" },
-  foo: { target: 'food', note: "'foo' -> 'food' (coda /d/ restore)" },
-  hunry: { target: 'hungry', note: "'hunry' -> 'hungry' (velar stop restore)" },
-  lunsh: { target: 'lunch', note: "'lunsh' -> 'lunch' (affricate restore)" },
-  shursh: { target: 'church', note: "'shursh' -> 'church'" },
-  wosh: { target: 'watch', note: "'wosh' -> 'watch'" },
-  wike: { target: 'like', note: "'wike' -> 'like' (liquid restore)" },
-  yeyo: { target: 'yellow', note: "'yeyo' -> 'yellow'" },
-  nee: { target: 'need', note: "'nee' -> 'need'" },
-  goo: { target: 'good', note: "'goo' -> 'good'" },
-  gooh: { target: 'good', note: "'gooh' -> 'good'" },
-  hell: { target: 'help', note: "'hell' -> 'help'" },
-  ha: { target: 'have', note: "'ha' -> 'have'" },
-  wan: { target: 'want', note: "'wan' -> 'want'" },
-  wanna: { target: 'want to', note: "'wanna' -> 'want to'" },
-  dat: { target: 'that', note: "'dat' -> 'that'" },
-  dis: { target: 'this', note: "'dis' -> 'this'" },
-  dem: { target: 'them', note: "'dem' -> 'them'" },
-  dey: { target: 'they', note: "'dey' -> 'they'" },
-  wit: { target: 'with', note: "'wit' -> 'with'" },
-  mouf: { target: 'mouth', note: "'mouf' -> 'mouth'" },
   dussin: { target: "doesn't", note: "'dussin' -> \"doesn't\"" },
   'ba-man': { target: 'Batman', note: "'ba-man' -> 'Batman'" },
   'spi-man': { target: 'Spiderman', note: "'spi-man' -> 'Spiderman'" }
 };
 
 /**
- * Phonetic acoustic resolver for when the deterministic dictionary/rulebook missed
- * and language model is unavailable or returned no output.
- * Ensures the interpreter NEVER echoes raw unintelligible phonetic speech back.
+ * Last-resort resolver for when the dictionary and rulebook explained nothing and no language model answered.
+ * Order: verified pair -> family notes -> his dictionary / verified words -> general sound-alike guess.
+ * It never reports high certainty: a pure guess stays below the auto-speak threshold, and if nothing could be
+ * resolved it returns the heard text with confidence 0 so callers do not present an echo as an answer.
  */
 export function resolveAcousticPhonetics(
   text: string,
@@ -935,10 +913,6 @@ export function resolveAcousticPhonetics(
     return { decoded: '', candidates: [], confidence: 0, coverage: 0, explanations: [] };
   }
 
-  const explanations: string[] = [];
-  let working = rawText;
-
-  // 1. Check exact phrase matches in trainingData
   const exactKey = lexKey(rawText);
   const exact = (options.trainingData || []).find(t => t.sound && lexKey(t.sound) === exactKey);
   if (exact && exact.meaning) {
@@ -952,99 +926,119 @@ export function resolveAcousticPhonetics(
     };
   }
 
-  // 2. Apply common phrase-level phonetic patterns
-  for (const [re, repl, note] of COMMON_PHONETIC_PHRASES) {
+  const explanations: string[] = [];
+  let working = rawText;
+
+  // 1. Phrases from the family's notes
+  for (const [re, repl, note] of FAMILY_PHRASES) {
     if (re.test(working)) {
       working = working.replace(re, repl);
       explanations.push(note);
     }
   }
+  const phraseResolved = working !== rawText;
 
-  // 3. Scan tokens against training pairs, lexicon, and common phonetic dictionary
-  const rawTokens = tokenize(rawText);
-  let resolvedCount = 0;
-
-  // Build lookup from verified training pairs for individual tokens
-  const pairTokenMap = new Map<string, string>();
+  // 2. Words he has taught us: his dictionary, single-word verified pairs and the family's invented words
+  const known = new Map<string, { value: string; note: string }>();
+  for (const e of options.lexicon || []) {
+    const k = lexKey(e.word);
+    if (k && !k.includes(' ') && !known.has(k)) {
+      const def = primaryMeaning(e.definition);
+      known.set(k, { value: def, note: `Matched dictionary: "${e.word}" -> "${def}"` });
+    }
+  }
   for (const p of options.trainingData || []) {
     const s = lexKey(p.sound);
     const m = String(p.meaning || '').trim();
-    if (s && m && !s.includes(' ') && !pairTokenMap.has(s)) {
-      pairTokenMap.set(s, m);
+    if (s && m && !s.includes(' ') && !known.has(s)) {
+      known.set(s, { value: m, note: `Matched library vocabulary: "${p.sound}" -> "${m}"` });
     }
   }
-
-  // Build lookup from lexicon
-  const lexMap = new Map<string, string>();
-  for (const e of options.lexicon || []) {
-    const k = lexKey(e.word);
-    if (k && !k.includes(' ') && !lexMap.has(k)) {
-      lexMap.set(k, primaryMeaning(e.definition));
-    }
+  for (const [k, v] of Object.entries(FAMILY_WORDS)) {
+    if (!known.has(k)) known.set(k, { value: v.target, note: v.note });
   }
 
-  const transformedWords = tokenize(working).map(tok => {
-    const k = tok.norm;
-    if (!k) return tok.raw;
-
-    if (lexMap.has(k)) {
-      resolvedCount++;
-      const def = lexMap.get(k)!;
-      explanations.push(`Matched dictionary: "${tok.raw}" -> "${def}"`);
-      return tok.lead + def + tok.trail;
-    }
-
-    if (pairTokenMap.has(k)) {
-      resolvedCount++;
-      const m = pairTokenMap.get(k)!;
-      explanations.push(`Matched library vocabulary: "${tok.raw}" -> "${m}"`);
-      return tok.lead + m + tok.trail;
-    }
-
-    if (COMMON_PHONETIC_WORDS[k]) {
-      resolvedCount++;
-      const item = COMMON_PHONETIC_WORDS[k];
-      explanations.push(item.note);
-      return tok.lead + item.target + tok.trail;
-    }
-
-    // Word is already standard English
-    if (/^(i|you|he|she|it|we|they|a|the|is|am|are|was|were|to|and|in|on|at|no|not|yes|my|your|mom|dad)$/i.test(k)) {
-      resolvedCount++;
-    }
-
-    return tok.raw;
-  });
-
-  let primary = polish(transformedWords.join(' '));
-
-  // Syntactic smoothing: insert missing copula if "I hungry" or "I thirsty"
-  primary = primary.replace(/\bI\s+(hungry|thirsty|tired|sad|happy|sleepy|sick)\b/gi, "I'm $1");
-  primary = primary.replace(/\bNo\s+ha\s+lunch\b/gi, "I didn't have lunch");
-  primary = primary.replace(/\bno\s+ha\s+lunch\b/gi, "didn't have lunch");
-
-  // Create variants
-  const alts: { text: string; probability: number }[] = [];
-  const alt1 = primary.replace(/\bI'm\b/g, 'I am').replace(/\bdidn't have\b/g, 'no');
-  if (alt1 !== primary) alts.push({ text: polish(alt1), probability: 0.12 });
-
-  const alt2 = primary.replace(/\bwant\b/g, 'need');
-  if (alt2 !== primary && alt2 !== alt1) alts.push({ text: polish(alt2), probability: 0.08 });
-
-  const coverage = rawTokens.length > 0 ? Math.min(1, Math.max(0.2, resolvedCount / rawTokens.length)) : 0;
-  const confidence = Math.min(0.86, Math.max(0.68, Math.round((0.68 + 0.18 * coverage) * 100) / 100));
-
-  const candidates = sanitizeCandidates([
-    { text: primary, probability: confidence },
-    ...alts,
-    { text: primary, probability: 0.05 }
+  // 3. Everything still unexplained goes to the general sound-alike guesser, in runs of consecutive words.
+  const personal = personalVocabFrom([
+    ...(options.trainingData || []).map(p => String(p.meaning || '')),
+    ...(options.lexicon || []).map(e => String(e.definition || ''))
   ]);
 
-  return {
-    decoded: primary,
-    candidates,
-    confidence,
-    coverage,
-    explanations
-  };
+  type Seg = { text: string; resolved: boolean };
+  const segs: Seg[] = [];
+  for (const tok of tokenize(working)) {
+    const hit = tok.norm ? known.get(tok.norm) : undefined;
+    if (hit) {
+      explanations.push(hit.note);
+      segs.push({ text: tok.lead + hit.value + tok.trail, resolved: true });
+    } else if (phraseResolved && !tok.norm) {
+      segs.push({ text: tok.raw, resolved: true });
+    } else {
+      segs.push({ text: tok.raw, resolved: false });
+    }
+  }
+  // Words produced by a family phrase are already final; only guess words that were in the original text.
+  const originalWords = new Set(tokenize(rawText).map(t => t.norm));
+
+  const runs: { start: number; end: number }[] = [];
+  segs.forEach((s, i) => {
+    if (s.resolved) return;
+    if (phraseResolved && !originalWords.has(lexKey(s.text))) {
+      s.resolved = true;
+      return;
+    }
+    const last = runs[runs.length - 1];
+    if (last && last.end === i) last.end = i + 1;
+    else runs.push({ start: i, end: i + 1 });
+  });
+
+  const guessedRuns: { run: { start: number; end: number }; alts: string[]; confidence: number; coverage: number }[] = [];
+  const pieces: string[] = segs.map(s => s.text);
+  for (const run of runs) {
+    const runText = segs.slice(run.start, run.end).map(s => s.text).join(' ');
+    const g = guessUtterance(runText, { personalWords: personal.words, personalBigrams: personal.bigrams });
+    if (g.changed && g.confidence > 0) {
+      pieces[run.start] = g.decoded;
+      for (let i = run.start + 1; i < run.end; i++) pieces[i] = '';
+      explanations.push(...g.explanations);
+      guessedRuns.push({
+        run,
+        alts: g.candidates.slice(1).map(c => c.text),
+        confidence: g.confidence,
+        coverage: g.coverage
+      });
+    }
+  }
+
+  const primary = polish(pieces.filter(Boolean).join(' '));
+  const resolvedTokens = segs.filter(s => s.resolved).length;
+  const total = segs.length || 1;
+  const guessedTokens = guessedRuns.reduce((n, g) => n + (g.run.end - g.run.start), 0);
+  const coverage = Math.min(1, (resolvedTokens + guessedTokens) / total);
+  const changed = lexKey(primary) !== lexKey(rawText);
+
+  // Certainty: a sound-alike guess is never sure. Nothing resolved at all means no answer, not a 72% echo.
+  let confidence = 0;
+  if (changed) {
+    confidence = guessedRuns.length > 0
+      ? Math.min(...guessedRuns.map(g => g.confidence))
+      : Math.min(0.74, 0.5 + 0.24 * coverage);
+    if (guessedRuns.length > 0 && resolvedTokens > 0) confidence = Math.min(0.7, confidence + 0.05);
+  }
+  if (!changed) {
+    return { decoded: rawText, candidates: [], confidence: 0, coverage: 0, explanations: [] };
+  }
+
+  // Alternatives: swap in the second-best reading of one guessed run at a time.
+  const alts: { text: string; probability: number }[] = [];
+  for (const g of guessedRuns) {
+    for (const alt of g.alts.slice(0, 2)) {
+      const swapped = pieces.slice();
+      swapped[g.run.start] = alt;
+      alts.push({ text: polish(swapped.filter(Boolean).join(' ')), probability: Math.max(0.03, Math.round(confidence * 0.35 * 100) / 100) });
+    }
+  }
+  const candidates = sanitizeCandidates([{ text: primary, probability: confidence }, ...alts]);
+
+  return { decoded: primary, candidates, confidence, coverage, explanations };
 }

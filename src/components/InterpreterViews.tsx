@@ -165,8 +165,10 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
     dictionary_rules: 'Dictionary + rulebook',
     llm_assisted: 'Dictionary + rulebook + language model',
     llm_only: 'Language model only (nothing in the dictionary or rulebook matched)',
-    unmatched: 'No dictionary or rule match'
+    phonetic_guess: 'Offline sound-alike guess (no dictionary, rule or model answer)',
+    unmatched: 'Could not work this out'
   };
+  const miniOn = /Mini LLM/i.test(phase1B?.miniModelUsed || '');
 
   return (
     <div className="w-full bg-slate-50/80 border border-slate-200 rounded-2xl p-4 space-y-3 text-left">
@@ -193,11 +195,23 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
           <span className="px-2 py-0.5 rounded bg-white border border-slate-200 text-slate-700">
             {Math.round(usage.coverage * 100)}% of words explained
           </span>
+          {usage.llm?.tried && !usage.llm.ok && (
+            <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
+              Language model did not answer
+            </span>
+          )}
           {usage.draftOverrodeModel && (
             <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-800">
               Dictionary overrode the language model
             </span>
           )}
+        </div>
+      )}
+
+      {usage?.llm?.tried && !usage.llm.ok && (
+        <div className="text-[11px] font-mono rounded-lg border border-amber-200 bg-amber-50 text-amber-900 px-3 py-2">
+          <span className="font-bold">The language model did not help with this one.</span>{' '}
+          {usage.llm.detail || 'No reason was reported.'} Check it under Settings &rarr; Check language model.
         </div>
       )}
 
@@ -246,9 +260,9 @@ export function MultiPhasePipelineViewer({ result }: { result: PipelineResult })
                 </span>
                 <div>
                   <div className="text-xs font-bold text-slate-800 font-mono flex items-center gap-2">
-                    <span>Phase 1B: Fine-Tuned Mini LLM Semantic Assumption</span>
+                    <span>{miniOn ? 'Phase 1B: Fine-Tuned Mini LLM Semantic Assumption' : 'Phase 1B: First-Pass Assumption'}</span>
                     <span className="text-[9px] font-bold px-1.5 py-0.2 bg-violet-50 text-violet-700 border border-violet-200 rounded font-mono">
-                      Fast 1st-Pass
+                      {miniOn ? 'Fast 1st-Pass' : 'Mini LLM off'}
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-500 font-mono truncate max-w-sm">
@@ -716,7 +730,9 @@ export function LowConfidenceView({
   onSubmit: (text: string) => void;
 }) {
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
-  const bestGuess = result.candidates[0]?.text || result.didYouMeanPrompt || "I need help";
+  // Never invent a guess: if nothing could be worked out, say so and let the family correct it.
+  const unresolved = result.usage?.unresolved === true;
+  const bestGuess = unresolved ? '' : (result.candidates[0]?.text || result.didYouMeanPrompt || '');
 
   useEffect(() => {
     playDing();
@@ -756,17 +772,30 @@ export function LowConfidenceView({
           <span className="text-xs font-mono font-bold uppercase tracking-wider text-indigo-600 block">
             Interpreter Verification Check
           </span>
-          <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-            Did you mean &ldquo;<span className="text-indigo-600">{bestGuess}</span>&rdquo;?
-          </h2>
-          <p className="text-xs text-slate-500 max-w-md mx-auto font-mono">
-            Certainty is {(result.final_confidence * 100).toFixed(0)}%. Confirm if this matches Paxton&apos;s intent, or provide a quick correction.
-          </p>
+          {bestGuess ? (
+            <>
+              <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight">
+                Did you mean &ldquo;<span className="text-indigo-600">{bestGuess}</span>&rdquo;?
+              </h2>
+              <p className="text-xs text-slate-500 max-w-md mx-auto font-mono">
+                Certainty is {(result.final_confidence * 100).toFixed(0)}%. Confirm if this matches Paxton&apos;s intent, or provide a quick correction.
+              </p>
+            </>
+          ) : (
+            <>
+              <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+                I couldn&apos;t work this one out
+              </h2>
+              <p className="text-xs text-slate-500 max-w-md mx-auto font-mono">
+                Nothing in the dictionary or rulebook matches, and the sounds don&apos;t resemble a known word. Type what he meant and it will be remembered.
+              </p>
+            </>
+          )}
         </div>
 
         {/* Big Yes and No Action Buttons */}
-        <div className="grid grid-cols-2 gap-4 max-w-md mx-auto pt-2">
-          <motion.button
+        <div className={`grid ${bestGuess ? 'grid-cols-2' : 'grid-cols-1'} gap-4 max-w-md mx-auto pt-2`}>
+          {bestGuess && <motion.button
             whileHover={{ scale: 1.02 }}
             whileTap={{ scale: 0.98 }}
             onClick={handleYes}
@@ -774,7 +803,7 @@ export function LowConfidenceView({
           >
             <Check className="w-5 h-5" />
             <span>Yes, that&apos;s it</span>
-          </motion.button>
+          </motion.button>}
 
           <motion.button
             whileHover={{ scale: 1.02 }}

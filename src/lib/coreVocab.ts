@@ -8,9 +8,9 @@
 export const CORE_VOCAB: string[] = [
   // people and self
   'i', 'me', 'my', 'mom', 'dad', 'you', 'we', 'he', 'she', 'it', 'they', 'baby', 'brother', 'sister', 'friend',
-  'grandma', 'grandpa', 'teacher', 'doctor', 'boy', 'girl', 'man', 'people',
+  'grandma', 'grandpa', 'teacher', 'doctor', 'man', 'boy', 'girl', 'people',
   // most common verbs and helpers
-  'want', 'have', 'need', 'go', 'do', 'is', 'am', 'are', 'was', 'like', 'see', 'get', 'eat', 'drink', 'play', 'help',
+  'want', 'have', 'need', 'go', 'do', 'is', 'am', 'are', 'was', 'like', 'book', 'see', 'get', 'eat', 'drink', 'play', 'help',
   'look', 'come', 'give', 'make', 'put', 'open', 'close', 'stop', 'wait', 'watch', 'read', 'sit', 'stand', 'walk',
   'run', 'jump', 'sleep', 'wash', 'brush', 'clean', 'take', 'turn', 'try', 'know', 'think', 'love', 'hug', 'hurt',
   'feel', 'say', 'tell', 'ask', 'sing', 'draw', 'build', 'throw', 'catch', 'push', 'pull', 'hold', 'carry', 'find',

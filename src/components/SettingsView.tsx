@@ -24,6 +24,7 @@ export function SettingsView() {
   const [saved, setSaved] = useState(false);
   const [storageDisabled, setStorageDisabled] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [llmCheck, setLlmCheck] = useState<null | { busy: boolean; ok?: boolean; text?: string }>(null);
 
   useEffect(() => {
     fetch('/api/settings').then(res => res.json()).then(setSettings).catch(console.error);
@@ -55,6 +56,25 @@ export function SettingsView() {
       });
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const checkLlm = async () => {
+    setLlmCheck({ busy: true });
+    try {
+      // save first so the check uses what is typed in the boxes
+      await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) });
+      const r = await (await fetch('/api/llm/status')).json();
+      const installed = Array.isArray(r.installedModels) && r.installedModels.length ? ` Installed models: ${r.installedModels.join(', ')}.` : '';
+      setLlmCheck({
+        busy: false,
+        ok: !!r.ok,
+        text: r.ok
+          ? `Working. Model "${r.model}" answered in ${(r.ms / 1000).toFixed(1)}s.${r.note ? ' ' + r.note : ''}`
+          : `${r.detail || 'No answer.'}${r.note ? ' ' + r.note : ''}${installed}`
+      });
+    } catch (e: any) {
+      setLlmCheck({ busy: false, ok: false, text: `Could not reach the app server: ${e?.message || e}` });
     }
   };
 
@@ -146,6 +166,33 @@ export function SettingsView() {
                   onChange={e => setSettings({ ...settings, llamaDictionaryModel: e.target.value })}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 focus:outline-none focus:border-indigo-300 focus:ring-1 focus:ring-indigo-300 transition-all text-sm font-mono shadow-inner"
                   placeholder="llama3"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={checkLlm}
+                    disabled={llmCheck?.busy}
+                    className="px-4 py-2 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 font-bold rounded-lg transition-colors text-xs cursor-pointer shadow-sm disabled:opacity-50"
+                  >
+                    {llmCheck?.busy ? 'Checking...' : 'Check language model'}
+                  </button>
+                  <span className="text-[11px] text-slate-500">Sends a tiny test prompt and shows exactly what happened.</span>
+                </div>
+                {llmCheck && !llmCheck.busy && (
+                  <div className={`text-xs font-mono rounded-lg border px-3 py-2 ${llmCheck.ok ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-amber-50 border-amber-200 text-amber-900'}`}>
+                    {llmCheck.text}
+                  </div>
+                )}
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest pt-2">Seconds to wait for the model</label>
+                <input
+                  type="number"
+                  min={5}
+                  max={300}
+                  value={Math.round((settings.llmTimeoutMs || 55000) / 1000)}
+                  onChange={e => setSettings({ ...settings, llmTimeoutMs: Math.max(5, Math.min(300, Number(e.target.value) || 55)) * 1000 })}
+                  className="w-32 bg-slate-50 border border-slate-200 rounded-xl p-2 text-slate-800 text-sm font-mono shadow-inner"
                 />
               </div>
 

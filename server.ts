@@ -7,6 +7,7 @@ import os from 'os';
 import util from 'util';
 import { exec, spawn, execSync } from 'child_process';
 import { createServer as createViteServer } from 'vite';
+import type { InterpretationUsage } from './src/types';
 import {
   AUTO_ACCEPT_CONFIDENCE,
   alternativeMeanings,
@@ -4061,13 +4062,19 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
       entries: matchedEntries,
       verifiedPairs: verifiedPairsFor(textTrim),
       pastConfirmations: (context?.pastMatches || []).map((p: any) => ({ heard: p.whisper_guess, confirmed: p.finalText })),
-      timeOfDay: context?.time
+      timeOfDay: context?.time,
+      soundAlikes: decoded.coverage < 1 && acoustic.confidence > 0
+        ? acoustic.candidates.slice(0, 3).map(c => c.text).filter(t => lexKey(t) !== lexKey(effectiveDraft))
+        : []
     });
 
     let candidates: { id: string; text: string; probability: number }[] = [];
     let confidence = 0;
     let llmUsed = false;
     let draftOverrodeModel = false;
+    const llmTrace = newLlmTrace();
+    let llmTried = false;
+    let unresolved = false;
 
     if (exactMeanings.length > 0) {
       // Verified memory: no model call. Several different verified meanings => let the user choose.
@@ -4081,7 +4088,8 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
     } else {
       let parsedResult: any = null;
       try {
-        const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true, 55000);
+        llmTried = true;
+        const rawResponse = await queryLlm(promptText, appSettings.llamaInterpreterModel || 'llama3', true, llmTimeoutMs(), llmTrace);
         if (rawResponse) {
           let cleanText = rawResponse.trim();
           const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
@@ -4154,17 +4162,37 @@ Output in 1 short phrase: What is your initial 1st-pass translation assumption o
         }
 
         confidence = decoded.coverage > 0 ? fallbackConfidence(decoded.coverage) : acoustic.confidence;
-        candidates = sanitizeCandidates([{ text: candidateA, probability: confidence }, ...alts]);
+        if (confidence <= 0) {
+          // Nothing explained these sounds and no sound-alike was close enough: say so instead of echoing
+          // the transcript with a made-up certainty.
+          unresolved = true;
+          confidence = 0.05;
+          candidates = [{ id: 'A', text: textTrim, probability: 0.05 }];
+        } else {
+          candidates = sanitizeCandidates([{ text: candidateA, probability: confidence }, ...alts]);
+        }
       }
     }
 
     const isLowCertainty = confidence < threshold;
     const mode = routeConfidence(confidence, threshold);
-    const didYouMeanPrompt = candidates[0]?.text || '';
-    const usage = summarizeUsage({ verifiedPair: exactMeanings.length > 0, llmUsed, decoded, draftOverrodeModel });
+    const didYouMeanPrompt = unresolved ? '' : (candidates[0]?.text || '');
+    const usage: InterpretationUsage = summarizeUsage({ verifiedPair: exactMeanings.length > 0, llmUsed, decoded, draftOverrodeModel });
     if (usage.coverage === 0 && acoustic.coverage > 0) {
       usage.coverage = Math.round(acoustic.coverage * 1000) / 1000;
     }
+    if (!llmUsed && exactMeanings.length === 0 && decoded.coverage === 0) {
+      usage.source = unresolved ? 'unmatched' : 'phonetic_guess';
+    }
+    usage.unresolved = unresolved;
+    usage.soundAlike = acoustic.confidence > 0 ? acoustic.decoded : undefined;
+    usage.llm = {
+      tried: llmTried,
+      ok: llmUsed,
+      model: llmTrace.model || (appSettings.llamaInterpreterModel || ''),
+      detail: llmTried && !llmUsed ? (llmTrace.ok ? 'the model answered but not in the expected format' : llmTrace.ollama) : '',
+      note: llmTrace.note || ''
+    };
 
     const phase4 = {
       matchedDictionaryEntries: matchedEntries.map(m => ({ word: m.word, definition: m.definition, type: m.type })),

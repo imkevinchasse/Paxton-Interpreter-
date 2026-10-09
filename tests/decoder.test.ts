@@ -323,7 +323,8 @@ test('resolveAcousticPhonetics decodes atypical speech phrases without failing t
   assert.ok(result.decoded.toLowerCase().includes('want food'));
   assert.ok(result.decoded.toLowerCase().includes('hungry'));
   assert.ok(result.decoded.toLowerCase().includes('lunch'));
-  assert.ok(result.confidence >= 0.70);
+  // a sound-alike guess must never be confident enough to auto-speak
+  assert.ok(result.confidence > 0.3 && result.confidence < 0.78);
   assert.ok(result.candidates.length >= 2);
   // Must NOT be the raw phonetic string
   assert.notEqual(result.decoded.toLowerCase(), 'iwa foo i hunry. no ha lunsh');

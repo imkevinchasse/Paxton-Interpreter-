@@ -75,12 +75,18 @@ export interface MultiPhaseInterpretation {
 
 /** Where an answer came from: proof that the dictionary and rulebook were (or were not) used. */
 export interface InterpretationUsage {
-  source: 'verified_pair' | 'dictionary_rules' | 'llm_assisted' | 'llm_only' | 'unmatched';
+  source: 'verified_pair' | 'dictionary_rules' | 'llm_assisted' | 'llm_only' | 'phonetic_guess' | 'unmatched';
   dictionaryEntriesUsed: number;
   rulesApplied: number;
   coverage: number;
   draft: string;
   draftOverrodeModel: boolean;
+  /** True when nothing explained the sounds and no sound-alike was close enough: there is no answer to show. */
+  unresolved?: boolean;
+  /** Best offline sound-alike reading, when one exists. */
+  soundAlike?: string;
+  /** Whether a language model was asked, whether it answered, and why not if it did not. */
+  llm?: { tried: boolean; ok: boolean; model: string; detail: string; note: string };
 }
 
 export interface PipelineResult {

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { type AppSettings } from '../types';
-import { Server, HardDrive, RefreshCw } from 'lucide-react';
+import { Server, HardDrive, RefreshCw, Zap } from 'lucide-react';
 
 export function SettingsView() {
   const [settings, setSettings] = useState<AppSettings>({
@@ -15,7 +15,11 @@ export function SettingsView() {
     whisperEndpoint: '',
     trainingEpochs: 10,
     trainingLR: '1e-5',
-    trainingBatchSize: 4
+    trainingBatchSize: 4,
+    simplifiedMode: false,
+    whisperTurboModel: 'openai/whisper-large-v3-turbo',
+    simplifiedConfidenceThreshold: 0.82,
+    lightLlmCorrectionEnabled: true
   });
   const [saved, setSaved] = useState(false);
   const [storageDisabled, setStorageDisabled] = useState(false);
@@ -193,6 +197,50 @@ export function SettingsView() {
               <p className="text-xs text-slate-400 mt-2">
                  Assign different models. e.g. A fast lightweight model for Interpreter and a larger smarter model for Dictionary Builder.
               </p>
+            </div>
+          </div>
+
+          <div className="border-t border-slate-100 pt-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-slate-800 text-sm uppercase tracking-wider flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-amber-600" /> Simplified Mode (Whisper-Large-v3-Turbo + LoRA)
+                </h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  Replaces the multi-phase clinical pipeline with a direct 3-step engine: Fine-tuned Whisper Turbo &rarr; Confidence check &rarr; Light context-aware LLM restoration &rarr; Immediate Speech.
+                </p>
+              </div>
+              <button 
+                onClick={() => setSettings(s => ({ ...s, simplifiedMode: !s.simplifiedMode }))}
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${settings.simplifiedMode ? 'bg-amber-600' : 'bg-slate-300'}`}
+              >
+                <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${settings.simplifiedMode ? 'translate-x-6' : 'translate-x-1'}`} />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Recommended Base Model</label>
+                <input 
+                  type="text" 
+                  value={settings.whisperTurboModel || 'openai/whisper-large-v3-turbo'}
+                  onChange={e => setSettings({ ...settings, whisperTurboModel: e.target.value })}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 text-sm font-mono shadow-inner focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-widest">Confidence Threshold for Light LLM (0-1)</label>
+                <input 
+                  type="number" 
+                  step="0.01"
+                  min="0.5"
+                  max="0.99"
+                  value={settings.simplifiedConfidenceThreshold || 0.82}
+                  onChange={e => setSettings({ ...settings, simplifiedConfidenceThreshold: parseFloat(e.target.value) || 0.82 })}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-slate-800 text-sm font-mono shadow-inner focus:outline-none focus:ring-1 focus:ring-amber-500"
+                />
+              </div>
             </div>
           </div>
 

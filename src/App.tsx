@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { Microphone } from './components/Microphone';
-import { ProcessingView, HighConfidenceView, MediumConfidenceView, LowConfidenceView } from './components/InterpreterViews';
+import { ProcessingView, HighConfidenceView, MediumConfidenceView, LowConfidenceView, SimplifiedResultView } from './components/InterpreterViews';
 import { SettingsView } from './components/SettingsView';
 import { TrainingStudio } from './components/TrainingStudio';
 import { TrainingStudioView } from './components/TrainingStudioView';
@@ -10,18 +10,21 @@ import { CrossReferenceStudioView } from './components/CrossReferenceStudioView'
 import { DictionaryView } from './components/DictionaryView';
 import { GrammarRulebookView } from './components/GrammarRulebookView';
 import { VersioningView } from './components/VersioningView';
+import { SimplifiedLoraStudioView } from './components/SimplifiedLoraStudioView';
 import { type Interaction, type PipelineResult, type ViewState } from './types';
+import { Zap } from 'lucide-react';
 
 export default function App() {
   const [interactions, setInteractions] = useState<Interaction[]>([]);
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState<PipelineResult | null>(null);
+  const [simplifiedMode, setSimplifiedMode] = useState<boolean>(false);
 
   // Persist current view across page reloads/watches
   const [currentView, setCurrentView] = useState<ViewState>(() => {
     try {
       const hash = window.location.hash.replace('#', '') as ViewState;
-      const validViews: ViewState[] = ['interpreter', 'training_studio', 'training', 'audiobank', 'dictionary', 'cross_reference', 'grammar_rulebook', 'versioning', 'settings'];
+      const validViews: ViewState[] = ['interpreter', 'simplified_lora', 'training_studio', 'training', 'audiobank', 'dictionary', 'cross_reference', 'grammar_rulebook', 'versioning', 'settings'];
       if (hash && validViews.includes(hash)) return hash;
 
       const saved = localStorage.getItem('paxton_current_view') as ViewState | null;
@@ -44,7 +47,26 @@ export default function App() {
       .then(res => res.json())
       .then(setInteractions)
       .catch(console.error);
+
+    fetch('/api/simplified/status')
+      .then(res => res.json())
+      .then(d => {
+        if (d && typeof d.simplifiedMode === 'boolean') {
+          setSimplifiedMode(d.simplifiedMode);
+        }
+      })
+      .catch(console.error);
   }, []);
+
+  const handleToggleSimplified = async () => {
+    try {
+      const res = await fetch('/api/simplified/toggle', { method: 'POST' });
+      const data = await res.json();
+      setSimplifiedMode(data.simplifiedMode);
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const handleProcess = async (blob: Blob | null, textTranscript?: string) => {
     setProcessing(true);
@@ -125,6 +147,19 @@ export default function App() {
             </h1>
           </div>
           <div className="flex items-center space-x-6">
+             <button
+               onClick={handleToggleSimplified}
+               className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider transition ${
+                 simplifiedMode
+                   ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                   : 'bg-slate-100 text-slate-600 hover:bg-slate-200 border border-slate-200'
+               }`}
+               title="Toggle between Simplified Turbo LoRA and Multi-Phase Clinical Pipeline"
+             >
+               <Zap className={`w-3.5 h-3.5 ${simplifiedMode ? 'fill-amber-600 text-amber-600' : 'text-slate-400'}`} />
+               <span>{simplifiedMode ? 'Simplified Mode (Turbo LoRA)' : 'Multi-Phase Clinical Mode'}</span>
+             </button>
+
              <div className="flex items-center gap-2">
                <span className="w-2 h-2 rounded-full bg-green-500"></span> 
                <span className="text-xs font-semibold text-slate-500 uppercase tracking-widest">System Live</span>
@@ -137,16 +172,23 @@ export default function App() {
              <div className="w-full flex-1 flex flex-col items-center justify-center">
                { !result && !processing && <Microphone onProcess={handleProcess} /> }
                { processing && <ProcessingView /> }
-               { result && (result.mode === 'clarification' || result.isLowCertainty || result.final_confidence < 0.78) && (
+               { result && result.isSimplifiedMode && (
+                 <SimplifiedResultView result={result} onDone={(txt) => finalizeInteraction(txt, 'A')} />
+               )}
+               { result && !result.isSimplifiedMode && (result.mode === 'clarification' || result.isLowCertainty || result.final_confidence < 0.78) && (
                  <LowConfidenceView result={result} onSubmit={(txt) => finalizeInteraction(txt, null)} />
                )}
-               { result && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'auto' && (
+               { result && !result.isSimplifiedMode && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'auto' && (
                  <HighConfidenceView result={result} onDone={(txt) => finalizeInteraction(txt, result.candidates[0]?.id || 'A')} />
                )}
-               { result && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'choice' && (
+               { result && !result.isSimplifiedMode && !result.isLowCertainty && result.final_confidence >= 0.78 && result.mode === 'choice' && (
                  <MediumConfidenceView result={result} onSelect={(id, txt) => finalizeInteraction(txt, id)} />
                )}
              </div>
+           )}
+
+           {currentView === 'simplified_lora' && (
+             <SimplifiedLoraStudioView />
            )}
 
            {currentView === 'training_studio' && (

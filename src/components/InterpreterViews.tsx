@@ -16,7 +16,8 @@ import {
   Database,
   Sliders,
   CheckCircle2,
-  AlertTriangle
+  AlertTriangle,
+  Zap
 } from 'lucide-react';
 import React, { useState, useEffect } from 'react';
 
@@ -1048,3 +1049,146 @@ export function MediumConfidenceView({
     </motion.div>
   );
 }
+
+interface SimplifiedResultViewProps {
+  result: PipelineResult;
+  onDone: (text: string) => void;
+}
+
+export function SimplifiedResultView({ result, onDone }: SimplifiedResultViewProps) {
+  const finalText = result.candidates?.[0]?.text || result.whisper_guess;
+  const [intendedCorrection, setIntendedCorrection] = useState<string>(finalText);
+  const [savedMessage, setSavedMessage] = useState<string | null>(null);
+  const [saving, setSaving] = useState<boolean>(false);
+
+  useEffect(() => {
+    playDing();
+    speakWithVoiceModel(finalText);
+  }, [finalText]);
+
+  const handleSaveCorrection = async () => {
+    if (!intendedCorrection.trim()) return;
+    setSaving(true);
+    try {
+      const res = await fetch('/api/simplified/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audioPairId: result.audioPairId,
+          intendedText: intendedCorrection.trim(),
+          sound: result.rawWhisperTranscript || result.whisper_guess
+        })
+      });
+      const data = await res.json();
+      if (data.success) {
+        setSavedMessage(`Saved "${intendedCorrection.trim()}" directly to data/pairs/ for next LoRA retrain!`);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 15 }} animate={{ opacity: 1, y: 0 }} className="w-full max-w-2xl px-4 mx-auto space-y-6">
+      {/* Header Banner */}
+      <div className="flex items-center justify-between">
+        <div className="inline-flex items-center gap-2 px-3.5 py-1.5 bg-amber-100 border border-amber-300 rounded-full text-amber-900 font-mono text-xs uppercase tracking-widest font-bold">
+          <Zap className="w-3.5 h-3.5 fill-amber-600 text-amber-600" />
+          <span>Simplified Pipeline &bull; openai/whisper-large-v3-turbo (LoRA)</span>
+        </div>
+        <span className="font-mono text-xs font-bold px-2.5 py-1 bg-slate-100 border border-slate-200 rounded-lg text-slate-700">
+          {(result.final_confidence * 100).toFixed(1)}% Confidence
+        </span>
+      </div>
+
+      {/* Main Result Card */}
+      <div className="bg-white border border-slate-200 rounded-3xl p-8 shadow-sm space-y-6">
+        <div>
+          <span className="text-xs uppercase font-bold tracking-wider text-slate-400 block mb-1 font-mono">
+            Whisper Turbo Raw Acoustic Guess:
+          </span>
+          <p className="text-base font-mono text-slate-600 bg-slate-50 p-3 rounded-xl border border-slate-200">
+            &ldquo;{result.rawWhisperTranscript || result.whisper_guess}&rdquo;
+          </p>
+        </div>
+
+        {result.lightLlmCorrectionApplied && (
+          <div className="p-3 rounded-xl bg-indigo-50 border border-indigo-200 flex items-center justify-between text-xs">
+            <span className="text-indigo-900 font-semibold flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-indigo-600" />
+              Light Context-Aware LLM Polish:
+            </span>
+            <span className="font-mono text-indigo-700">{result.correctionReason || 'Phonological recovery'}</span>
+          </div>
+        )}
+
+        <div className="pt-2">
+          <span className="text-xs uppercase font-bold tracking-wider text-amber-600 block mb-2 font-mono">
+            Final English Intent:
+          </span>
+          <h2 className="text-3xl font-black text-slate-900 tracking-tight leading-tight">
+            &ldquo;{finalText}&rdquo;
+          </h2>
+        </div>
+
+        <div className="flex items-center gap-3 pt-4 border-t border-slate-100">
+          <button
+            onClick={() => speakWithVoiceModel(finalText)}
+            className="flex-1 flex items-center justify-center gap-2 px-5 py-3.5 rounded-2xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs uppercase tracking-wider transition shadow-sm"
+          >
+            <Volume2 className="w-4 h-4" />
+            <span>Speak Again</span>
+          </button>
+
+          <button
+            onClick={() => onDone(finalText)}
+            className="flex-1 flex items-center justify-center gap-2 px-5 py-3.5 rounded-2xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs uppercase tracking-wider transition shadow-sm"
+          >
+            <Check className="w-4 h-4" />
+            <span>Accept &amp; Next</span>
+          </button>
+        </div>
+
+        {/* Continuous Improvement Loop Card */}
+        <div className="mt-6 pt-5 border-t border-slate-100 bg-slate-50/80 p-5 rounded-2xl space-y-3">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5 uppercase tracking-wider">
+              <Sparkles className="w-4 h-4 text-amber-600" /> Continuous Improvement Loop
+            </span>
+            <span className="text-[10px] text-slate-400 font-mono">Severe Speech Calibration</span>
+          </div>
+          <p className="text-xs text-slate-500 leading-relaxed">
+            Did Paxton mean something else? Enter the exact sentence below to save to <code className="bg-slate-200 px-1 rounded text-slate-800">data/pairs/</code> for the next LoRA fine-tuning cycle.
+          </p>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={intendedCorrection}
+              onChange={e => setIntendedCorrection(e.target.value)}
+              placeholder="What did Paxton actually mean?"
+              className="flex-1 px-3.5 py-2.5 rounded-xl bg-white border border-slate-200 text-xs font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-amber-500"
+            />
+            <button
+              disabled={saving || !intendedCorrection.trim()}
+              onClick={handleSaveCorrection}
+              className="px-4 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs uppercase tracking-wider transition disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+            >
+              <CheckCircle2 className="w-3.5 h-3.5" />
+              <span>Save to LoRA</span>
+            </button>
+          </div>
+
+          {savedMessage && (
+            <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-medium">
+              ✓ {savedMessage}
+            </div>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+

@@ -865,6 +865,15 @@ export interface PhoneticResolution {
 }
 
 const COMMON_PHONETIC_PHRASES: [RegExp, string, string][] = [
+  [/\bwatubah!?\s*(?:i'm\s+nass\s+a\s+)?love\s+you\s+mom\b/gi, "I want talk about I love you mom", "Resolved 'Watubah! ...' -> 'I want talk about I love you mom'"],
+  [/\bwakabah\s+to\s+you\b/gi, "I wan talk to you", "Resolved 'Wakabah to you' -> 'I wan talk to you'"],
+  [/\bam\s+i\s+a\s+black\??\b/gi, "I like mower, black", "Resolved 'Am I a black' -> 'I like mower, black'"],
+  [/\bbest\s+you\s+ah\s+i\s+lost\s+a\s+job\b/gi, "go back to work I lost a job", "Resolved 'best you ah...' -> 'go back to work I lost a job'"],
+  [/\bwah\s+out\s+tobah\b/gi, "ran out toilet paper", "Resolved 'wah out Tobah' -> 'ran out toilet paper'"],
+  [/\bask\s+dussin\s+more\s+tobah\b/gi, "ask Dustin more Toilet paper", "Resolved 'ask dussin more Tobah' -> 'ask Dustin more Toilet paper'"],
+  [/\bfeel\s+mad\s+bad\s+caskon\b/gi, "feel mad black cat's gone", "Resolved 'mad bad caskon' -> \"mad black cat's gone\""],
+  [/\bcassin\s+mya\s+blackwet\s+cats?\b/gi, "Cat my black white cat", "Resolved 'Cassin mya blackwet cats' -> 'Cat my black white cat'"],
+  [/\bi\s+see\s+you\s+some\b/gi, "I like sing, I like sing song", "Resolved 'I see you some' -> 'I like sing, I like sing song'"],
   [/\bno\s+(?:ha|have)\b/gi, "didn't have", "Resolved 'no ha' -> \"didn't have\""],
   [/\bno\s+(?:wan|want)\b/gi, "don't want", "Resolved 'no wan' -> \"don't want\""],
   [/\biwa\s+foo\b/gi, "I want food", "Resolved 'iwa foo' -> 'I want food'"],
@@ -875,6 +884,13 @@ const COMMON_PHONETIC_PHRASES: [RegExp, string, string][] = [
 ];
 
 const COMMON_PHONETIC_WORDS: Record<string, { target: string; note: string }> = {
+  tobah: { target: 'toilet paper', note: "'Tobah' -> 'toilet paper'" },
+  watubah: { target: 'I want talk about', note: "'Watubah' -> 'I want talk about'" },
+  wakabah: { target: 'I wan talk to', note: "'Wakabah' -> 'I wan talk to'" },
+  caskon: { target: "cat's gone", note: "'caskon' -> \"cat's gone\"" },
+  cassin: { target: 'Cat', note: "'Cassin' -> 'Cat'" },
+  blackwet: { target: 'black white', note: "'blackwet' -> 'black white'" },
+  mya: { target: 'my', note: "'mya' -> 'my'" },
   iwa: { target: 'I want', note: "'iwa' -> 'I want'" },
   foo: { target: 'food', note: "'foo' -> 'food' (coda /d/ restore)" },
   hunry: { target: 'hungry', note: "'hunry' -> 'hungry' (velar stop restore)" },

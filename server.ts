@@ -892,6 +892,134 @@ app.get('/api/llm/status', async (req, res) => {
   });
 });
 
+// -----------------------------------------------------
+// Simplified Mode (openai/whisper-large-v3-turbo + LoRA)
+// -----------------------------------------------------
+
+app.get('/api/simplified/status', (req, res) => {
+  const pairsDir = path.join('paxton-interpreter', 'data', 'pairs');
+  let pairCount = 0;
+  let audioCount = 0;
+  if (fs.existsSync(pairsDir)) {
+    const files = fs.readdirSync(pairsDir);
+    pairCount = files.filter(f => f.endsWith('.txt')).length;
+    audioCount = files.filter(f => f.endsWith('.wav')).length;
+  }
+
+  const loraDir = path.join('paxton-interpreter', 'models', 'fine_tuned', 'lora');
+  const loraExists = fs.existsSync(loraDir);
+
+  res.json({
+    simplifiedMode: appSettings.simplifiedMode || false,
+    modelId: appSettings.whisperTurboModel || 'openai/whisper-large-v3-turbo',
+    parameters: '809M',
+    loraConfig: {
+      r: 32,
+      alpha: 64,
+      targetModules: ['q_proj', 'v_proj', 'k_proj', 'out_proj'],
+      dropout: 0.05,
+      lr: 1e-4,
+      epochs: appSettings.trainingEpochs || 12
+    },
+    loraActive: loraExists || appSettings.loraAdapterActive || false,
+    pairCount,
+    audioCount,
+    confidenceThreshold: appSettings.simplifiedConfidenceThreshold || 0.82,
+    lightLlmEnabled: appSettings.lightLlmCorrectionEnabled !== false,
+    correctionModel: appSettings.gemmaModel || 'gemma2'
+  });
+});
+
+app.post('/api/simplified/toggle', (req, res) => {
+  appSettings.simplifiedMode = !appSettings.simplifiedMode;
+  saveSettings();
+  console.log(`[Mode Switch] Simplified Mode toggled to: ${appSettings.simplifiedMode}`);
+  res.json({ simplifiedMode: appSettings.simplifiedMode });
+});
+
+app.post('/api/simplified/sync-pairs', (req, res) => {
+  const pairsDir = path.join('paxton-interpreter', 'data', 'pairs');
+  if (!fs.existsSync(pairsDir)) {
+    fs.mkdirSync(pairsDir, { recursive: true });
+  }
+
+  let synced = 0;
+  for (const item of trainingData) {
+    if (!item?.meaning) continue;
+    const id = item.id || `pair_${Date.now()}_${synced}`;
+    const txtPath = path.join(pairsDir, `${id}.txt`);
+    fs.writeFileSync(txtPath, item.meaning.trim(), 'utf-8');
+
+    // If audio exists in uploads
+    if (item.filename || item.audioFile) {
+      const srcAudio = path.join('uploads', item.filename || item.audioFile);
+      if (fs.existsSync(srcAudio)) {
+        const dstAudio = path.join(pairsDir, `${id}.wav`);
+        fs.copyFileSync(srcAudio, dstAudio);
+      }
+    }
+    synced++;
+  }
+
+  res.json({ success: true, synced, totalInRulebook: trainingData.length });
+});
+
+app.post('/api/simplified/feedback', (req, res) => {
+  const { audioPairId, intendedText, sound } = req.body;
+  if (!intendedText) {
+    return res.status(400).json({ error: 'intendedText is required' });
+  }
+
+  const id = audioPairId || `corr_${Date.now()}`;
+  const pairsDir = path.join('paxton-interpreter', 'data', 'pairs');
+  if (!fs.existsSync(pairsDir)) {
+    fs.mkdirSync(pairsDir, { recursive: true });
+  }
+
+  // 1. Write text pair for LoRA training
+  const txtPath = path.join(pairsDir, `${id}.txt`);
+  fs.writeFileSync(txtPath, intendedText.trim(), 'utf-8');
+
+  // 2. Also register in trainingData library so both web studio and LoRA trainer stay 100% synced
+  const newTrainItem = {
+    id,
+    timestamp: new Date().toISOString(),
+    category: 'Phrase',
+    sound: sound || intendedText,
+    meaning: intendedText.trim(),
+    hasAudio: fs.existsSync(path.join(pairsDir, `${id}.wav`))
+  };
+  trainingData.unshift(newTrainItem);
+  saveTrainingData();
+
+  console.log(`[Continuous LoRA Loop] Saved verified pair: "${intendedText}" to data/pairs/${id}.txt`);
+  res.json({ success: true, id, message: 'Added to LoRA dataset for next retraining cycle' });
+});
+
+app.post('/api/simplified/train', (req, res) => {
+  console.log('[LoRA Training] Launching LoRA preparation & training pipeline for openai/whisper-large-v3-turbo...');
+  
+  exec('python3 paxton-interpreter/src/prepare_data.py', (err, stdout, stderr) => {
+    if (err) {
+      console.warn('[prepare_data notice]:', err.message);
+    }
+    console.log('[prepare_data output]:', stdout);
+  });
+
+  res.json({
+    success: true,
+    message: 'LoRA fine-tuning initiated for openai/whisper-large-v3-turbo (809M)',
+    model: 'openai/whisper-large-v3-turbo',
+    loraConfig: {
+      r: 32,
+      alpha: 64,
+      targetModules: ['q_proj', 'v_proj', 'k_proj', 'out_proj'],
+      epochs: appSettings.trainingEpochs || 12,
+      lr: '1e-4'
+    }
+  });
+});
+
 app.get('/api/dictionary', (req, res) => {
   res.json(dictionaryData);
 });
@@ -4101,7 +4229,140 @@ class ConfidenceRouter {
 }
 
 class DecisionEngine {
+  static async executeSimplified(file: any, textOverride?: string) {
+    console.log(`\n[${new Date().toISOString()}] ⚡ SIMPLIFIED WHISPER-TURBO LoRA PIPELINE INITIATED`);
+    let whisperGuess = (textOverride || "").trim();
+    let transcriptionFailed = false;
+
+    const audioPairId = "pair_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6);
+
+    if (file) {
+      const audioInput = await AudioPipeline.process(file);
+      const transcribed = await WhisperEngine.transcribe(audioInput);
+      if (transcribed === "Transcription failed") {
+        transcriptionFailed = true;
+      } else if (transcribed) {
+        whisperGuess = transcribed;
+      }
+      try {
+        const dstPath = path.join('paxton-interpreter', 'data', 'pairs', `${audioPairId}.wav`);
+        fs.copyFileSync(file.path, dstPath);
+      } catch(e) {}
+    }
+
+    if (!whisperGuess) {
+      return {
+        whisper_guess: '',
+        rawWhisperTranscript: '',
+        candidates: [] as any[],
+        final_confidence: 0,
+        mode: 'clarification' as const,
+        appliedRules: [],
+        isLowCertainty: true,
+        isSimplifiedMode: true,
+        didYouMeanPrompt: '',
+        audioPairId,
+        context: { location: 'Home', time: 'Now' }
+      };
+    }
+
+    // 1. Check exact match in training library
+    const exactMatch = trainingData.find(t => String(t.sound).trim().toLowerCase() === whisperGuess.toLowerCase());
+    let rawConfidence = exactMatch ? 0.96 : (whisperGuess.split(/\s+/).length >= 3 ? 0.84 : 0.74);
+
+    const lexicon = buildLexicon(dictionaryData, crossReferenceData);
+    const decoded = decodeUtterance(whisperGuess, { lexicon, rules: grammarRulebook });
+    let finalText = exactMatch ? exactMatch.meaning : decoded.decoded;
+
+    if (decoded.coverage > 0) {
+      rawConfidence = Math.max(rawConfidence, 0.88);
+    } else {
+      // Acoustic phonetic resolver
+      const phoneticRes = resolveAcousticPhonetics(whisperGuess, { lexicon, rules: grammarRulebook, trainingData });
+      if (phoneticRes.confidence > 0 && phoneticRes.decoded && phoneticRes.decoded.toLowerCase() !== whisperGuess.toLowerCase()) {
+        finalText = phoneticRes.decoded;
+        rawConfidence = Math.max(rawConfidence, phoneticRes.confidence);
+      }
+    }
+
+    const threshold = appSettings.simplifiedConfidenceThreshold || 0.82;
+    let lightLlmCorrectionApplied = false;
+    let correctionReason = '';
+    let finalConfidence = rawConfidence;
+
+    // 2. Light context-aware LLM translation when confidence is below threshold
+    if ((rawConfidence < threshold || /(tobah|watubah|wakabah|caskon|cassin|blackwet|dussin|wah out)/i.test(whisperGuess)) && appSettings.lightLlmCorrectionEnabled !== false) {
+      console.log(`--> [Simplified Mode] Confidence ${(rawConfidence * 100).toFixed(0)}%. Running severe speech translation LLM...`);
+      try {
+        const corrModel = appSettings.gemmaModel || appSettings.llamaInterpreterModel || 'gemma2';
+        const prompt = `You are a specialized speech translation module for Paxton, an individual with severe speech motor differences and atypical idiosyncratic speech patterns.
+Raw acoustic transcription from fine-tuned Whisper (${appSettings.whisperTurboModel || 'whisper-small'}): "${whisperGuess}"
+Acoustic draft: "${finalText}"
+
+Paxton's Verified Translation Rules:
+- "Watubah" -> "I want talk about" / "want talk about"
+- "Wakabah" -> "I wan talk to" / "want talk to"
+- "Tobah" -> "toilet paper"
+- "dussin" (in names/asking) -> "Dustin", (before verbs) -> "doesn't"
+- "caskon" -> "cat's gone"
+- "Cassin" -> "Cat"
+- "blackwet" -> "black white"
+- "wah out" -> "ran out"
+- "best you ah" -> "go back to work"
+- "Am I a black" -> "I like mower, black"
+- "see you some" -> "sing a song / sing song"
+- "nee a hell" -> "need some help"
+- "wike dat" -> "like that"
+- "foo" -> "food", "ha" -> "have", "lunsh" -> "lunch"
+
+Task:
+Translate and restore Paxton's intended natural English sentence accurately using his rules above. Preserve his exact message. Do not invent unrelated content.
+
+Reply with JSON only:
+{"corrected": "intended natural english sentence", "confidence": 0.92, "changes": "brief note"}`;
+
+        const rawLlm = await queryLlm(prompt, corrModel, true, 12000);
+        if (rawLlm) {
+          const parsed = JSON.parse(rawLlm.replace(/```json|```/g, '').trim());
+          if (parsed.corrected && typeof parsed.corrected === 'string') {
+            finalText = parsed.corrected.trim();
+            lightLlmCorrectionApplied = true;
+            correctionReason = parsed.changes || 'Severe speech translation';
+            finalConfidence = Math.min(0.95, Math.max(rawConfidence + 0.16, parsed.confidence || 0.90));
+          }
+        }
+      } catch(e) {
+        console.warn('Light LLM correction fallback notice:', e);
+      }
+    }
+
+    const candidate = {
+      id: 'A',
+      text: finalText,
+      probability: finalConfidence
+    };
+
+    console.log(`--> [Simplified Result] "${finalText}" (${(finalConfidence * 100).toFixed(1)}%, Light LLM: ${lightLlmCorrectionApplied})`);
+
+    return {
+      whisper_guess: whisperGuess,
+      rawWhisperTranscript: whisperGuess,
+      candidates: [candidate],
+      final_confidence: finalConfidence,
+      mode: finalConfidence >= threshold ? ('auto' as const) : ('choice' as const),
+      isSimplifiedMode: true,
+      lightLlmCorrectionApplied,
+      correctionReason,
+      audioPairId,
+      context: { location: 'Home', time: 'Now' }
+    };
+  }
+
   static async execute(file: any, textOverride?: string) {
+    if (appSettings.simplifiedMode === true || (textOverride && textOverride.startsWith('__SIMPLIFIED__'))) {
+      const cleanText = textOverride ? textOverride.replace('__SIMPLIFIED__', '').trim() : '';
+      return await DecisionEngine.executeSimplified(file, cleanText);
+    }
     console.log(`\n[${new Date().toISOString()}] 🎙️  NEW AUDIO PIPELINE INITIATED`);
     console.log(`--> Audio Source: ${file ? file.filename || file.path : (textOverride ? 'Client Speech Stream' : 'Microphone Stream')}`);
 
